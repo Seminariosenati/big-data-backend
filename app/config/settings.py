@@ -20,6 +20,13 @@ class Settings:
     smtp_pass: str = os.environ.get("SMTP_PASS", "")
     smtp_from: str = os.environ.get("SMTP_FROM", "")
 
+    resend_api_key: str = os.environ.get("RESEND_API_KEY", "")
+
+    emailjs_service_id: str = os.environ.get("EMAILJS_SERVICE_ID", "")
+    emailjs_template_id: str = os.environ.get("EMAILJS_TEMPLATE_ID", "")
+    emailjs_public_key: str = os.environ.get("EMAILJS_PUBLIC_KEY", "")
+    emailjs_private_key: str = os.environ.get("EMAILJS_PRIVATE_KEY", "")
+
     otp_length: int = int(os.environ.get("OTP_LENGTH", 6))
     otp_expiration_minutes: int = int(os.environ.get("OTP_EXPIRATION_MINUTES", 10))
     otp_max_attempts: int = int(os.environ.get("OTP_MAX_ATTEMPTS", 5))

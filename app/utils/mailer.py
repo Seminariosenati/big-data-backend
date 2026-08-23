@@ -1,34 +1,42 @@
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import requests
 
 from app.config.settings import get_settings
 
+EMAILJS_ENDPOINT = "https://api.emailjs.com/api/v1.0/email/send"
+
 
 def send_otp_email(to_email: str, code: str) -> None:
+    """Envía el código OTP usando la API REST de EmailJS.
+
+    Render bloquea las conexiones SMTP salientes (puertos 25/465/587) en el
+    plan gratuito, por eso no usamos smtplib. EmailJS envía por HTTPS (443)
+    y su propio servidor es el que se conecta a Gmail por detrás, así que
+    el bloqueo de puertos de Render no afecta.
+
+    Requiere que en el dashboard de EmailJS:
+      1. Se haya creado un "Email Service" conectado a tu cuenta de Gmail.
+      2. Se haya creado un "Email Template" con las variables:
+         {{to_email}}, {{code}}, {{expiration_minutes}}
+      3. Se haya activado "API requests for non-browser applications"
+         en Account -> Security (si no, EmailJS rechaza la llamada).
+    """
     settings = get_settings()
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = "Tu código de verificación — Datalume"
-    msg["From"] = settings.smtp_from or settings.smtp_user
-    msg["To"] = to_email
+    payload = {
+        "service_id": settings.emailjs_service_id,
+        "template_id": settings.emailjs_template_id,
+        "user_id": settings.emailjs_public_key,
+        "accessToken": settings.emailjs_private_key,
+        "template_params": {
+            "to_email": to_email,
+            "code": code,
+            "expiration_minutes": settings.otp_expiration_minutes,
+        },
+    }
 
-    text = f"Tu código de verificación es: {code}. Vence en {settings.otp_expiration_minutes} minutos."
-    html = f"""
-    <div style="font-family: sans-serif; max-width: 420px; margin: 0 auto;">
-      <h2 style="color:#111;">Verifica tu inicio de sesión</h2>
-      <p style="color:#444;">Usa este código para completar tu inicio de sesión en Datalume:</p>
-      <div style="font-size: 32px; font-weight: 700; letter-spacing: 6px; background:#f4f4f5; padding: 16px 24px; border-radius: 8px; text-align:center; margin: 16px 0;">
-        {code}
-      </div>
-      <p style="color:#888; font-size: 13px;">Este código vence en {settings.otp_expiration_minutes} minutos. Si no fuiste tú, ignora este correo.</p>
-    </div>
-    """
+    response = requests.post(EMAILJS_ENDPOINT, json=payload, timeout=10)
 
-    msg.attach(MIMEText(text, "plain"))
-    msg.attach(MIMEText(html, "html"))
-
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
-        server.starttls()
-        server.login(settings.smtp_user, settings.smtp_pass)
-        server.sendmail(msg["From"], [to_email], msg.as_string())
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"EmailJS respondió {response.status_code}: {response.text}"
+        )
