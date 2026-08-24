@@ -238,7 +238,15 @@ def apply_clean_dataset(dataset_id: str, options: CleaningOptions, auth=Depends(
         log_rows.append({"dataset_id": dataset_id, "user_id": user.id, "action": "empty_row_removed", "row_data": row})
     for col in log["columns_removed"]:
         log_rows.append({"dataset_id": dataset_id, "user_id": user.id, "action": "column_removed", "row_data": {"column": col}})
-    if log["nulls_filled_count"]:
+    if log["nulls_filled_cells"]:
+        for cell in log["nulls_filled_cells"]:
+            log_rows.append({
+                "dataset_id": dataset_id,
+                "user_id": user.id,
+                "action": "nulls_filled",
+                "row_data": {"estrategia": options.null_strategy, **cell},
+            })
+    elif log["nulls_filled_count"]:
         log_rows.append({
             "dataset_id": dataset_id,
             "user_id": user.id,
@@ -262,6 +270,22 @@ def apply_clean_dataset(dataset_id: str, options: CleaningOptions, auth=Depends(
     supabase.table("cleaned_datasets").insert(
         {"dataset_id": dataset_id, "cleaned_file_path": cleaned_path, "status": "Procesado"}
     ).execute()
+
+    # Recalcular calidad/estado con los datos YA limpios y reflejarlo en el
+    # dataset original: si no hacemos esto, el Dashboard, la tabla de
+    # "Archivos subidos" y el donut de calidad siguen mostrando los valores
+    # de antes de limpiar (0%, "Con errores"), aunque el archivo ya esté ok.
+    analysis = analyze_dataset(cleaned_df)
+    supabase.table("datasets").update(
+        {
+            "row_count": analysis["row_count"],
+            "column_count": analysis["column_count"],
+            "null_count": analysis["null_count"],
+            "duplicate_count": analysis["duplicate_count"],
+            "quality_score": analysis["quality_score"],
+            "status": analysis["status"],
+        }
+    ).eq("id", dataset_id).execute()
 
     payload = _df_to_preview_payload(cleaned_df, dataset["file_name"])
     payload["summary"] = {

@@ -99,7 +99,27 @@ def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.Data
         "empty_rows_removed": [],
         "columns_removed": [],
         "nulls_filled_count": 0,
+        "nulls_filled_cells": [],
     }
+
+    # Nombre de una columna "identificadora" (la primera) para poder mostrar
+    # a qué fila pertenece cada celda modificada en el historial, sin tener
+    # que exponer la fila completa.
+    ref_col = working.columns[0] if len(working.columns) else None
+
+    def _log_null_cells(mask: pd.DataFrame, after: pd.DataFrame) -> None:
+        rows, cols = np.where(mask.to_numpy())
+        for r, c in zip(rows, cols):
+            col_name = mask.columns[c]
+            row_label = mask.index[r]
+            log["nulls_filled_cells"].append(
+                {
+                    "fila": str(working.loc[row_label, ref_col]) if ref_col is not None else str(row_label),
+                    "columna": str(col_name),
+                    "antes": "(vacío)",
+                    "despues": None if pd.isna(after.loc[row_label, col_name]) else str(after.loc[row_label, col_name]),
+                }
+            )
 
     if options.get("remove_duplicates"):
         dup_mask = working.duplicated(keep="first")
@@ -120,16 +140,26 @@ def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.Data
         log["nulls_filled_count"] = int(empty_mask.sum().sum())
         # Texto literal "null" (visible), no un None/NaN invisible en la tabla.
         working = working.astype(object).mask(empty_mask, "null")
+        _log_null_cells(empty_mask, working)
 
     elif null_strategy == "zero":
         numeric_cols = working.select_dtypes(include="number").columns
-        log["nulls_filled_count"] = int(working[numeric_cols].isnull().sum().sum())
+        empty_mask = working[numeric_cols].isnull()
+        log["nulls_filled_count"] = int(empty_mask.sum().sum())
         working[numeric_cols] = working[numeric_cols].fillna(0)
+        full_mask = pd.DataFrame(False, index=working.index, columns=working.columns)
+        full_mask[numeric_cols] = empty_mask
+        _log_null_cells(full_mask, working)
 
     elif null_strategy == "average":
         numeric_cols = working.select_dtypes(include="number").columns
-        log["nulls_filled_count"] = int(working[numeric_cols].isnull().sum().sum())
+        empty_mask = working[numeric_cols].isnull()
+        log["nulls_filled_count"] = int(empty_mask.sum().sum())
         working[numeric_cols] = working[numeric_cols].fillna(working[numeric_cols].mean())
+        full_mask = pd.DataFrame(False, index=working.index, columns=working.columns)
+        full_mask[numeric_cols] = empty_mask
+        _log_null_cells(full_mask, working)
+
 
     if options.get("convert_number"):
         for col in working.select_dtypes(include="object").columns:
@@ -139,7 +169,19 @@ def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.Data
 
     if options.get("convert_dates"):
         for col in working.select_dtypes(include="object").columns:
-            converted = pd.to_datetime(working[col], errors="coerce")
+            non_null = working[col].dropna()
+            non_null = non_null[non_null.astype(str).str.strip() != ""]
+            if non_null.empty:
+                continue
+
+            # Si la columna es mayormente numérica (edad, id, etc.), no es una
+            # columna de fechas: pandas interpretaría esos números como
+            # nanosegundos desde 1970-01-01 y los convertiría por error.
+            numeric_like = pd.to_numeric(non_null, errors="coerce")
+            if numeric_like.notna().mean() > 0.5:
+                continue
+
+            converted = pd.to_datetime(working[col], errors="coerce", format="mixed", dayfirst=True)
             if converted.notna().sum() > 0:
                 working[col] = converted.dt.strftime("%Y-%m-%d").where(converted.notna(), working[col])
 
