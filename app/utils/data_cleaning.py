@@ -1,4 +1,5 @@
 import io
+import json
 import numpy as np
 import pandas as pd
 
@@ -78,16 +79,74 @@ def analyze_dataset(df: pd.DataFrame) -> dict:
     }
 
 
-def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.DataFrame, dict]:
     """
-    Limpieza básica: elimina filas totalmente vacías, quita duplicados exactos,
-    y limpia espacios en columnas de texto.
+    Limpieza real, controlada por opciones (lo que llega desde el frontend).
+    Nunca borra datos en silencio: devuelve también un `log` con todo lo que
+    se quitó/cambió (filas, columnas, valores), para poder guardarlo en la
+    tabla `cleaning_logs` en vez de perderlo para siempre.
+
+    options:
+      remove_duplicates: bool
+      null_strategy: 'ignore' | 'remove_row' | 'set_null' | 'zero' | 'average'
+      convert_number: bool
+      convert_dates: bool
+      remove_empty_columns: bool
     """
-    cleaned = df.copy()
-    cleaned = cleaned.dropna(how="all")
-    cleaned = cleaned.drop_duplicates()
+    working = df.copy()
+    log = {
+        "duplicate_rows_removed": [],
+        "empty_rows_removed": [],
+        "columns_removed": [],
+        "nulls_filled_count": 0,
+    }
 
-    for col in cleaned.select_dtypes(include=["object"]).columns:
-        cleaned[col] = cleaned[col].astype(str).str.strip()
+    if options.get("remove_duplicates"):
+        dup_mask = working.duplicated(keep="first")
+        if dup_mask.any():
+            log["duplicate_rows_removed"] = json.loads(working[dup_mask].to_json(orient="records"))
+            working = working[~dup_mask]
 
-    return cleaned
+    null_strategy = options.get("null_strategy", "ignore")
+
+    if null_strategy == "remove_row":
+        empty_mask = working.isnull().any(axis=1)
+        if empty_mask.any():
+            log["empty_rows_removed"] = json.loads(working[empty_mask].to_json(orient="records"))
+            working = working[~empty_mask]
+
+    elif null_strategy == "set_null":
+        empty_mask = working.isnull()
+        log["nulls_filled_count"] = int(empty_mask.sum().sum())
+        # Texto literal "null" (visible), no un None/NaN invisible en la tabla.
+        working = working.astype(object).mask(empty_mask, "null")
+
+    elif null_strategy == "zero":
+        numeric_cols = working.select_dtypes(include="number").columns
+        log["nulls_filled_count"] = int(working[numeric_cols].isnull().sum().sum())
+        working[numeric_cols] = working[numeric_cols].fillna(0)
+
+    elif null_strategy == "average":
+        numeric_cols = working.select_dtypes(include="number").columns
+        log["nulls_filled_count"] = int(working[numeric_cols].isnull().sum().sum())
+        working[numeric_cols] = working[numeric_cols].fillna(working[numeric_cols].mean())
+
+    if options.get("convert_number"):
+        for col in working.select_dtypes(include="object").columns:
+            converted = pd.to_numeric(working[col], errors="coerce")
+            if converted.notna().sum() > 0:
+                working[col] = converted.where(converted.notna(), working[col])
+
+    if options.get("convert_dates"):
+        for col in working.select_dtypes(include="object").columns:
+            converted = pd.to_datetime(working[col], errors="coerce")
+            if converted.notna().sum() > 0:
+                working[col] = converted.dt.strftime("%Y-%m-%d").where(converted.notna(), working[col])
+
+    if options.get("remove_empty_columns"):
+        empty_cols = [c for c in working.columns if working[c].isnull().all()]
+        if empty_cols:
+            log["columns_removed"] = empty_cols
+            working = working.drop(columns=empty_cols)
+
+    return working, log
