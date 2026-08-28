@@ -4,7 +4,16 @@ import json
 
 from app.config.settings import get_supabase_admin, get_settings
 from app.utils.auth_dependency import require_auth
-from app.utils.data_cleaning import read_dataset, analyze_dataset, clean_dataset_with_options
+import io
+import pandas as pd
+
+from app.utils.data_cleaning import (
+    read_dataset,
+    analyze_dataset,
+    clean_dataset_with_options,
+    detect_chart_columns,
+    aggregate_chart_column,
+)
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
@@ -155,6 +164,66 @@ def get_stats(auth=Depends(require_auth)):
         "totalErrors": total_errors,
         "qualityBreakdown": {"ok": ok, "warn": warn, "error": error},
     }
+
+
+def _get_cleaned_dfs(supabase, settings, user_id: str) -> list[pd.DataFrame]:
+    """Descarga la versión limpia más reciente de cada dataset del usuario
+    (para agregar sus valores en los gráficos del dashboard)."""
+    owned = supabase.table("datasets").select("id").eq("user_id", user_id).execute()
+    dataset_ids = [d["id"] for d in (owned.data or [])]
+    if not dataset_ids:
+        return []
+
+    cleaned = (
+        supabase.table("cleaned_datasets")
+        .select("*")
+        .in_("dataset_id", dataset_ids)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    latest_by_dataset: dict[str, dict] = {}
+    for row in cleaned.data or []:
+        latest_by_dataset.setdefault(row["dataset_id"], row)
+
+    dfs: list[pd.DataFrame] = []
+    for row in latest_by_dataset.values():
+        try:
+            file_bytes = supabase.storage.from_(settings.datasets_bucket).download(row["cleaned_file_path"])
+            dfs.append(pd.read_csv(io.BytesIO(file_bytes)))
+        except Exception:
+            continue
+    return dfs
+
+
+@router.get("/charts/columns")
+def get_chart_columns(auth=Depends(require_auth)):
+    """Columnas disponibles (agregando TODOS los datasets ya limpios del
+    usuario) para poblar el selector de columna de los gráficos."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    dfs = _get_cleaned_dfs(supabase, settings, user.id)
+    return {"columns": detect_chart_columns(dfs)}
+
+
+@router.get("/charts/data")
+def get_chart_data(column: str, auth=Depends(require_auth)):
+    """Datos agregados (histograma o conteo de categorías) de una columna,
+    combinando TODOS los datasets ya limpios del usuario."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    dfs = _get_cleaned_dfs(supabase, settings, user.id)
+    if not dfs:
+        raise HTTPException(status_code=404, detail="Todavía no tienes datasets limpios")
+
+    result = aggregate_chart_column(dfs, column)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Esa columna no existe en tus datasets limpios")
+    return result
 
 
 @router.get("/{dataset_id}/cleaning-logs")
