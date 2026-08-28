@@ -192,3 +192,57 @@ def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.Data
             working = working.drop(columns=empty_cols)
 
     return working, log
+
+
+def detect_chart_columns(dfs: list[pd.DataFrame]) -> list[dict]:
+    """Une las columnas de todos los datasets ya limpios (`dfs`) y clasifica
+    cada una como 'numeric' o 'categorical', para poblar el selector de
+    columna de los gráficos del dashboard."""
+    info: dict[str, dict] = {}
+
+    for df in dfs:
+        for col in df.columns:
+            col = str(col)
+            series = df[col]
+            entry = info.setdefault(col, {"numeric_votes": 0, "total_votes": 0})
+            entry["total_votes"] += 1
+            if np.issubdtype(series.dtype, np.number):
+                entry["numeric_votes"] += 1
+
+    columns = [
+        {"name": col, "type": "numeric" if entry["numeric_votes"] == entry["total_votes"] else "categorical"}
+        for col, entry in info.items()
+    ]
+    return sorted(columns, key=lambda c: c["name"].lower())
+
+
+def aggregate_chart_column(dfs: list[pd.DataFrame], column: str, bins: int = 8, top_n: int = 10) -> dict | None:
+    """Combina los valores de `column` a través de TODOS los datasets ya
+    limpios y devuelve datos listos para graficar: histograma si la columna
+    es numérica, conteo de categorías (top N + 'Otros') si es texto.
+    Devuelve None si la columna no existe en ningún dataset limpio."""
+    matching = [df[column] for df in dfs if column in df.columns]
+    if not matching:
+        return None
+
+    combined = pd.concat(matching, ignore_index=True).dropna()
+    if combined.empty:
+        return {"column": column, "type": "categorical", "data": []}
+
+    if np.issubdtype(combined.dtype, np.number):
+        unique_count = combined.nunique()
+        bucket_count = max(1, min(bins, unique_count))
+        counts, edges = np.histogram(combined, bins=bucket_count)
+        data = [
+            {"label": f"{edges[i]:.2f} – {edges[i + 1]:.2f}", "value": int(counts[i])}
+            for i in range(len(counts))
+        ]
+        return {"column": column, "type": "numeric", "data": data}
+
+    value_counts = combined.astype(str).value_counts()
+    top = value_counts.head(top_n)
+    data = [{"label": str(k), "value": int(v)} for k, v in top.items()]
+    other_count = int(value_counts.iloc[top_n:].sum())
+    if other_count > 0:
+        data.append({"label": "Otros", "value": other_count})
+    return {"column": column, "type": "categorical", "data": data}
