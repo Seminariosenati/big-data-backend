@@ -9,7 +9,7 @@ from app.utils.data_cleaning import read_dataset, analyze_dataset, clean_dataset
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 ALLOWED_EXTENSIONS = (".csv", ".xlsx", ".xls")
-PREVIEW_ROW_LIMIT = 1000
+PREVIEW_ROW_LIMIT = 50
 
 
 class CleaningOptions(BaseModel):
