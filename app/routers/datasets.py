@@ -226,6 +226,111 @@ def get_chart_data(column: str, auth=Depends(require_auth)):
     return result
 
 
+def _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id: str) -> pd.DataFrame | None:
+    """Descarga la versión limpia más reciente de UN dataset puntual (no de
+    todos los del usuario), para que los gráficos puedan mostrar solo el
+    archivo que el usuario tiene seleccionado en el dashboard."""
+    cleaned = (
+        supabase.table("cleaned_datasets")
+        .select("*")
+        .eq("dataset_id", dataset_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not cleaned.data:
+        return None
+
+    row = cleaned.data[0]
+    try:
+        file_bytes = supabase.storage.from_(settings.datasets_bucket).download(row["cleaned_file_path"])
+        return pd.read_csv(io.BytesIO(file_bytes))
+    except Exception:
+        return None
+
+
+@router.get("/{dataset_id}/cleaned-preview")
+def get_cleaned_dataset_preview(dataset_id: str, auth=Depends(require_auth)):
+    """Columnas + filas de la versión YA LIMPIA de este dataset, para el
+    Dashboard (que debe mostrar datos después de la limpieza, no el archivo
+    tal como se subió). Si el dataset todavía no pasó por limpieza, 404."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    dataset = _get_owned_dataset(supabase, dataset_id, user.id)  # valida dueño / 404
+    df = _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id)
+    if df is None:
+        raise HTTPException(status_code=404, detail="Este dataset todavía no tiene una versión limpia")
+
+    return _df_to_preview_payload(df, dataset["file_name"])
+
+
+@router.get("/{dataset_id}/charts/columns")
+def get_chart_columns_for_dataset(dataset_id: str, auth=Depends(require_auth)):
+    """Columnas disponibles de la versión limpia de ESTE dataset (para que el
+    selector de columna del gráfico refleje solo el archivo elegido)."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    _get_owned_dataset(supabase, dataset_id, user.id)  # valida dueño / 404
+    df = _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id)
+
+    return {"columns": detect_chart_columns([df] if df is not None else [])}
+
+
+@router.get("/{dataset_id}/charts/data")
+def get_chart_data_for_dataset(dataset_id: str, column: str, auth=Depends(require_auth)):
+    """Datos agregados (histograma o conteo de categorías) de una columna,
+    usando SOLO la versión limpia de este dataset (no todos los del usuario),
+    para que el gráfico cambie al cambiar de dataset en el dashboard."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    _get_owned_dataset(supabase, dataset_id, user.id)
+    df = _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id)
+    if df is None:
+        raise HTTPException(status_code=404, detail="Este dataset todavía no tiene una versión limpia")
+
+    result = aggregate_chart_column([df], column)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Esa columna no existe en la versión limpia de este dataset")
+    return result
+
+
+@router.get("/{dataset_id}/charts/raw/columns")
+def get_raw_chart_columns_for_dataset(dataset_id: str, auth=Depends(require_auth)):
+    """Columnas disponibles del archivo TAL COMO SE SUBIÓ (sin limpiar), para
+    que también se puedan graficar los datos con errores/valores sucios."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    dataset = _get_owned_dataset(supabase, dataset_id, user.id)
+    df = _download_dataset_df(supabase, settings, dataset)
+
+    return {"columns": detect_chart_columns([df])}
+
+
+@router.get("/{dataset_id}/charts/raw/data")
+def get_raw_chart_data_for_dataset(dataset_id: str, column: str, auth=Depends(require_auth)):
+    """Datos agregados de una columna usando el archivo original SIN limpiar
+    (incluye nulos, duplicados y valores mal formateados tal cual llegaron)."""
+    user = auth["user"]
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    dataset = _get_owned_dataset(supabase, dataset_id, user.id)
+    df = _download_dataset_df(supabase, settings, dataset)
+
+    result = aggregate_chart_column([df], column)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Esa columna no existe en este dataset")
+    return result
+
+
 @router.get("/{dataset_id}/cleaning-logs")
 def get_cleaning_logs(dataset_id: str, auth=Depends(require_auth)):
     """Historial de todo lo que se quitó/cambió al limpiar este dataset
