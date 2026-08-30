@@ -428,3 +428,4 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
         "sales_column_detected": sales_col,
         "recommendations": recommendations,
     }
+    
