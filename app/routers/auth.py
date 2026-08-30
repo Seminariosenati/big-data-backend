@@ -48,6 +48,10 @@ class ResendOtpInput(BaseModel):
     email: EmailStr
 
 
+class RefreshInput(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+
 # ---------------------------------------------------------
 # POST /auth/register
 # ---------------------------------------------------------
@@ -217,3 +221,26 @@ def resend_otp(payload: ResendOtpInput, background_tasks: BackgroundTasks):
     background_tasks.add_task(_send_otp_email_safe, payload.email, code)
 
     return {"message": "Código reenviado"}
+
+
+# ---------------------------------------------------------
+# POST /auth/refresh — renueva el access token usando el refresh token
+# ---------------------------------------------------------
+@router.post("/refresh")
+def refresh_session(payload: RefreshInput):
+    supabase_anon = get_supabase_anon()
+
+    try:
+        auth_response = supabase_anon.auth.refresh_session(payload.refresh_token)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión inválida o expirada")
+
+    if not auth_response or not auth_response.session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión inválida o expirada")
+
+    return {
+        "session": {
+            "access_token": auth_response.session.access_token,
+            "refresh_token": auth_response.session.refresh_token,
+        }
+    }

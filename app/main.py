@@ -5,7 +5,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.config.settings import get_settings
-from app.routers import auth, profile, datasets
+from app.routers import auth, profile, datasets, users
+from app.routers import settings as settings_router
 
 settings = get_settings()
 
@@ -26,6 +27,8 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(profile.router)
 app.include_router(datasets.router)
+app.include_router(settings_router.router)
+app.include_router(users.router)
 
 
 @app.get("/health")

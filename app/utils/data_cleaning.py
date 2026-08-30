@@ -192,3 +192,239 @@ def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.Data
             working = working.drop(columns=empty_cols)
 
     return working, log
+
+
+def detect_chart_columns(dfs: list[pd.DataFrame]) -> list[dict]:
+    """Une las columnas de todos los datasets ya limpios (`dfs`) y clasifica
+    cada una como 'numeric' o 'categorical', para poblar el selector de
+    columna de los gráficos del dashboard."""
+    info: dict[str, dict] = {}
+
+    for df in dfs:
+        for col in df.columns:
+            col = str(col)
+            series = df[col]
+            entry = info.setdefault(col, {"numeric_votes": 0, "total_votes": 0})
+            entry["total_votes"] += 1
+            if np.issubdtype(series.dtype, np.number):
+                entry["numeric_votes"] += 1
+
+    columns = [
+        {"name": col, "type": "numeric" if entry["numeric_votes"] == entry["total_votes"] else "categorical"}
+        for col, entry in info.items()
+    ]
+    return sorted(columns, key=lambda c: c["name"].lower())
+
+
+def aggregate_chart_column(dfs: list[pd.DataFrame], column: str, bins: int = 8, top_n: int = 10) -> dict | None:
+    """Combina los valores de `column` a través de TODOS los datasets ya
+    limpios y devuelve datos listos para graficar: histograma si la columna
+    es numérica, conteo de categorías (top N + 'Otros') si es texto.
+    Devuelve None si la columna no existe en ningún dataset limpio."""
+    matching = [df[column] for df in dfs if column in df.columns]
+    if not matching:
+        return None
+
+    combined = pd.concat(matching, ignore_index=True).dropna()
+    if combined.empty:
+        return {"column": column, "type": "categorical", "data": []}
+
+    if np.issubdtype(combined.dtype, np.number):
+        unique_count = combined.nunique()
+        bucket_count = max(1, min(bins, unique_count))
+        counts, edges = np.histogram(combined, bins=bucket_count)
+        data = [
+            {"label": f"{edges[i]:.2f} – {edges[i + 1]:.2f}", "value": int(counts[i])}
+            for i in range(len(counts))
+        ]
+        return {"column": column, "type": "numeric", "data": data}
+
+    value_counts = combined.astype(str).value_counts()
+    top = value_counts.head(top_n)
+    data = [{"label": str(k), "value": int(v)} for k, v in top.items()]
+    other_count = int(value_counts.iloc[top_n:].sum())
+    if other_count > 0:
+        data.append({"label": "Otros", "value": other_count})
+    return {"column": column, "type": "categorical", "data": data}
+
+
+# ---------------------------------------------------------------------------
+# Comparación entre empresas del mismo rubro (benchmarking)
+#
+# IMPORTANTE: nada de lo que hay aquí toca la base de datos. El CSV de la
+# "otra empresa" solo vive como DataFrame en memoria durante esta función;
+# no se guarda en Storage, no se inserta en `datasets`, no se sube a ningún
+# lado. Al terminar la función (o la request), Python libera esa memoria.
+# Esto es intencional: el rol 'analyst' puede comparar datos pero jamás
+# puede escribir/borrar nada en el sistema.
+# ---------------------------------------------------------------------------
+
+SALES_COLUMN_CANDIDATES = ["ventas", "venta", "sales", "total_venta", "monto", "importe", "total"]
+DATE_COLUMN_CANDIDATES = ["fecha", "date", "fecha_venta"]
+CATEGORY_COLUMN_CANDIDATES = ["categoria", "categoría", "category", "producto", "product"]
+
+
+def _find_sales_column(df: pd.DataFrame) -> str | None:
+    """Busca una columna numérica que probablemente represente ventas."""
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in SALES_COLUMN_CANDIDATES:
+        if candidate in lower_map:
+            col = lower_map[candidate]
+            if np.issubdtype(df[col].dtype, np.number):
+                return col
+    return None
+
+
+def _find_date_column(df: pd.DataFrame) -> str | None:
+    """Prioriza columnas ya convertidas a datetime; si no hay, busca por
+    nombre entre las candidatas típicas."""
+    for col in df.columns:
+        if np.issubdtype(df[col].dtype, np.datetime64):
+            return col
+
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in DATE_COLUMN_CANDIDATES:
+        if candidate in lower_map:
+            return lower_map[candidate]
+    return None
+
+
+def _find_category_column(df: pd.DataFrame) -> str | None:
+    """Busca una columna categórica (texto) típica de producto/categoría."""
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in CATEGORY_COLUMN_CANDIDATES:
+        if candidate in lower_map:
+            col = lower_map[candidate]
+            if not np.issubdtype(df[col].dtype, np.number):
+                return col
+    return None
+
+
+def compute_sales_summary(df: pd.DataFrame) -> dict | None:
+    """Calcula KPIs de ventas reales (no de calidad de datos) a partir de la
+    versión limpia de un dataset: ventas totales, ticket promedio, categoría
+    top y tendencia mensual. Devuelve None si no se pudo identificar una
+    columna de monto (ninguna de las candidatas de SALES_COLUMN_CANDIDATES
+    está presente como columna numérica)."""
+    sales_col = _find_sales_column(df)
+    if sales_col is None:
+        return None
+
+    sales = pd.to_numeric(df[sales_col], errors="coerce").dropna()
+    if sales.empty:
+        return None
+
+    total_sales = float(sales.sum())
+    avg_ticket = float(sales.mean())
+    row_count = int(sales.shape[0])
+
+    top_category = None
+    category_col = _find_category_column(df)
+    if category_col is not None:
+        grouped = df.groupby(category_col)[sales_col].sum(numeric_only=True).sort_values(ascending=False)
+        grouped = grouped.dropna()
+        if not grouped.empty:
+            top_category = {"name": str(grouped.index[0]), "total": float(grouped.iloc[0])}
+
+    monthly: list[dict] = []
+    trend_pct = None
+    date_col = _find_date_column(df)
+    if date_col is not None:
+        working = df[[date_col, sales_col]].copy()
+        working[date_col] = pd.to_datetime(working[date_col], errors="coerce", format="mixed", dayfirst=True)
+        working[sales_col] = pd.to_numeric(working[sales_col], errors="coerce")
+        working = working.dropna()
+        if not working.empty:
+            working["month"] = working[date_col].dt.to_period("M").astype(str)
+            monthly_totals = working.groupby("month")[sales_col].sum().sort_index()
+            monthly = [{"month": m, "total": float(v)} for m, v in monthly_totals.items()]
+            if len(monthly_totals) >= 2:
+                prev, last = monthly_totals.iloc[-2], monthly_totals.iloc[-1]
+                if prev > 0:
+                    trend_pct = round(((last - prev) / prev) * 100, 1)
+
+    return {
+        "sales_column": str(sales_col),
+        "date_column": str(date_col) if date_col is not None else None,
+        "category_column": str(category_col) if category_col is not None else None,
+        "total_sales": round(total_sales, 2),
+        "avg_ticket": round(avg_ticket, 2),
+        "row_count": row_count,
+        "top_category": top_category,
+        "monthly": monthly,
+        "trend_pct": trend_pct,
+    }
+
+
+def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> dict:
+    """Compara la estructura de dos tablas del MISMO rubro (ej. farmacia vs
+    farmacia) y genera una recomendación simple:
+
+    1. Detecta qué columnas tiene 'other_df' que 'own_df' NO tiene.
+    2. Si en 'other_df' existe una columna de ventas, calcula si las filas
+       donde la columna extra está "activa" (no nula / valor truthy) tienen
+       en promedio más ventas que las filas donde no está.
+    3. Devuelve columnas extra + recomendación en texto, listo para mostrar
+       en el frontend del analista.
+
+    Ninguno de los DataFrames se persiste: son parámetros en memoria y se
+    descartan al retornar.
+    """
+    own_columns = {str(c).strip().lower() for c in own_df.columns}
+    other_columns = [str(c) for c in other_df.columns]
+
+    extra_columns = [c for c in other_columns if c.strip().lower() not in own_columns]
+
+    sales_col = _find_sales_column(other_df)
+
+    recommendations = []
+    for col in extra_columns:
+        entry = {"column": col, "impact_pct": None, "message": None}
+
+        if sales_col is not None:
+            series = other_df[col]
+            has_value = series.notna()
+            # columnas booleanas/texto tipo "si/no" también cuentan como activas
+            if series.dtype == object:
+                has_value = series.astype(str).str.strip().str.lower().isin(
+                    ["si", "sí", "yes", "true", "1", "x"]
+                ) | (series.notna() & (series.astype(str).str.strip() != ""))
+
+            with_col = other_df.loc[has_value, sales_col].dropna()
+            without_col = other_df.loc[~has_value, sales_col].dropna()
+
+            if len(with_col) > 0 and len(without_col) > 0:
+                avg_with = float(with_col.mean())
+                avg_without = float(without_col.mean())
+                if avg_without > 0:
+                    impact_pct = round(((avg_with - avg_without) / avg_without) * 100, 1)
+                    entry["impact_pct"] = impact_pct
+                    if impact_pct > 0:
+                        entry["message"] = (
+                            f"Las filas con '{col}' muestran un promedio de ventas "
+                            f"{impact_pct}% mayor. Te recomendamos incorporar esta columna."
+                        )
+                    else:
+                        entry["message"] = (
+                            f"'{col}' no muestra una mejora clara en ventas "
+                            f"({impact_pct}%). No es prioritario incorporarla."
+                        )
+
+        if entry["message"] is None:
+            entry["message"] = (
+                f"La otra tabla tiene la columna '{col}' que tú no tienes, "
+                "pero no se encontró una columna de ventas para medir su impacto."
+            )
+
+        recommendations.append(entry)
+
+    # ordena mostrando primero las de mayor impacto positivo
+    recommendations.sort(key=lambda r: (r["impact_pct"] is None, -(r["impact_pct"] or 0)))
+
+    return {
+        "own_columns": sorted(own_columns),
+        "other_columns": other_columns,
+        "extra_columns": extra_columns,
+        "sales_column_detected": sales_col,
+        "recommendations": recommendations,
+    }
