@@ -58,8 +58,13 @@ def analyze_dataset(df: pd.DataFrame) -> dict:
     null_ratio = total_nulls / total_cells if total_cells else 0
     duplicate_ratio = duplicate_count / row_count if row_count else 0
 
-    # Score simple de calidad: penaliza nulos y duplicados
-    quality_score = round(max(0.0, 100 - (null_ratio * 60 + duplicate_ratio * 40) * 100), 2)
+    # Score simple de calidad: penaliza nulos y duplicados.
+    # null_ratio y duplicate_ratio ya son fracciones (0-1). Los pesos (60/40)
+    # representan la penalización MÁXIMA en puntos si el ratio fuera 100%,
+    # así que NO hay que volver a multiplicar por 100 (antes se hacía dos
+    # veces y un dataset con apenas 1-2% de nulos/duplicados terminaba con
+    # score 0, como si estuviera lleno de errores).
+    quality_score = round(max(0.0, 100 - (null_ratio * 60 + duplicate_ratio * 40)), 2)
 
     if quality_score >= 90:
         status = "ok"
@@ -428,4 +433,3 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
         "sales_column_detected": sales_col,
         "recommendations": recommendations,
     }
-    
