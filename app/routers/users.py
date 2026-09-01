@@ -60,12 +60,12 @@ class UpdatePermissionsInput(BaseModel):
 @router.get("")
 def list_analysts(auth=Depends(require_role("admin"))):
     supabase = get_supabase_admin()
-    admin_id = auth["user"].id
+    env_id = auth["env_id"]
 
     profiles = (
         supabase.table("profiles")
         .select("id, full_name, phone, created_at")
-        .eq("owner_id", admin_id)
+        .eq("owner_id", env_id)
         .eq("role", "analyst")
         .order("created_at", desc=False)
         .execute()
@@ -105,7 +105,8 @@ def list_analysts(auth=Depends(require_role("admin"))):
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_analyst(payload: CreateAnalystInput, auth=Depends(require_role("admin"))):
     supabase = get_supabase_admin()
-    admin_id = auth["user"].id
+    admin_id = auth["user"].id  # quién lo crea (queda como created_by, para auditoría)
+    env_id = auth["env_id"]  # a qué entorno pertenece (de ahí saca sus datasets)
 
     try:
         result = supabase.auth.admin.create_user(
@@ -124,9 +125,11 @@ def create_analyst(payload: CreateAnalystInput, auth=Depends(require_role("admin
     new_user_id = result.user.id
 
     # El trigger on_auth_user_created ya insertó una fila en profiles con
-    # role='admin' por defecto; la corregimos a analyst + owner_id.
+    # role='admin' por defecto; la corregimos a analyst + owner_id=env_id,
+    # así queda en el mismo entorno aunque quien lo cree sea un admin
+    # secundario (no el admin raíz).
     supabase.table("profiles").update(
-        {"role": "analyst", "owner_id": admin_id, "full_name": payload.full_name}
+        {"role": "analyst", "owner_id": env_id, "full_name": payload.full_name}
     ).eq("id", new_user_id).execute()
 
     supabase.table("analyst_permissions").insert(
@@ -258,9 +261,13 @@ def verify_create_admin(payload: VerifyCreateAdminInput, auth=Depends(require_ro
     new_user_id = result.user.id
 
     # El trigger on_auth_user_created ya crea el perfil con role='admin' por
-    # defecto y owner_id=None (un admin siempre es dueño de sí mismo); solo
-    # nos aseguramos de que el nombre completo quede guardado.
-    supabase.table("profiles").update({"full_name": otp_row["pending_full_name"]}).eq("id", new_user_id).execute()
+    # defecto. Lo unimos al MISMO ENTORNO de quien lo creó (env_id), para
+    # que ambos admins vean y compartan los mismos datasets/analistas — si
+    # quien lo crea es a su vez un admin secundario, env_id ya apunta al
+    # admin raíz, así que no se forman cadenas.
+    supabase.table("profiles").update(
+        {"full_name": otp_row["pending_full_name"], "owner_id": auth["env_id"]}
+    ).eq("id", new_user_id).execute()
 
     return {
         "message": "Cuenta de administrador creada correctamente.",
@@ -313,18 +320,19 @@ def update_analyst_permissions(
     analyst_id: str, payload: UpdatePermissionsInput, auth=Depends(require_role("admin"))
 ):
     supabase = get_supabase_admin()
-    admin_id = auth["user"].id
+    admin_id = auth["user"].id  # quién hace el cambio (queda en created_by)
+    env_id = auth["env_id"]  # el entorno al que debe pertenecer el analista
 
     owned = (
         supabase.table("profiles")
         .select("id")
         .eq("id", analyst_id)
-        .eq("owner_id", admin_id)
+        .eq("owner_id", env_id)
         .limit(1)
         .execute()
     )
     if not owned.data:
-        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu cuenta")
+        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu entorno")
 
     data = {"user_id": analyst_id, "created_by": admin_id, **payload.model_dump()}
     result = (
@@ -346,23 +354,23 @@ class UpdateDatasetAccessInput(BaseModel):
 @router.get("/{analyst_id}/datasets")
 def list_analyst_dataset_access(analyst_id: str, auth=Depends(require_role("admin"))):
     supabase = get_supabase_admin()
-    admin_id = auth["user"].id
+    env_id = auth["env_id"]
 
     owned = (
         supabase.table("profiles")
         .select("id")
         .eq("id", analyst_id)
-        .eq("owner_id", admin_id)
+        .eq("owner_id", env_id)
         .limit(1)
         .execute()
     )
     if not owned.data:
-        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu cuenta")
+        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu entorno")
 
     datasets = (
         supabase.table("datasets")
         .select("id, file_name, created_at")
-        .eq("user_id", admin_id)
+        .eq("user_id", env_id)
         .order("created_at", desc=True)
         .execute()
     )
@@ -390,26 +398,26 @@ def update_analyst_dataset_access(
     analyst_id: str, payload: UpdateDatasetAccessInput, auth=Depends(require_role("admin"))
 ):
     supabase = get_supabase_admin()
-    admin_id = auth["user"].id
+    env_id = auth["env_id"]
 
     owned = (
         supabase.table("profiles")
         .select("id")
         .eq("id", analyst_id)
-        .eq("owner_id", admin_id)
+        .eq("owner_id", env_id)
         .limit(1)
         .execute()
     )
     if not owned.data:
-        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu cuenta")
+        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu entorno")
 
-    # Solo se permiten datasets que de verdad son del admin (nunca de otro).
+    # Solo se permiten datasets que de verdad son del entorno (nunca de otro).
     valid_ids: list[str] = []
     if payload.dataset_ids:
         valid = (
             supabase.table("datasets")
             .select("id")
-            .eq("user_id", admin_id)
+            .eq("user_id", env_id)
             .in_("id", payload.dataset_ids)
             .execute()
         )
@@ -430,18 +438,18 @@ def update_analyst_dataset_access(
 @router.delete("/{analyst_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_analyst(analyst_id: str, auth=Depends(require_role("admin"))):
     supabase = get_supabase_admin()
-    admin_id = auth["user"].id
+    env_id = auth["env_id"]
 
     owned = (
         supabase.table("profiles")
         .select("id")
         .eq("id", analyst_id)
-        .eq("owner_id", admin_id)
+        .eq("owner_id", env_id)
         .limit(1)
         .execute()
     )
     if not owned.data:
-        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu cuenta")
+        raise HTTPException(status_code=404, detail="Ese analista no pertenece a tu entorno")
 
     supabase.auth.admin.delete_user(analyst_id)
     return None

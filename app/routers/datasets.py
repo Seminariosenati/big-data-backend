@@ -33,12 +33,13 @@ class CleaningOptions(BaseModel):
 
 def _accessible_dataset_ids(supabase, auth: dict) -> list[str]:
     """IDs de datasets que este usuario puede ver:
-    - admin: los suyos (los que subió)
+    - admin: los del entorno (env_id) — es decir, todos los que suban él
+      u OTROS admins que compartan el mismo entorno (creados entre ellos)
     - analyst: los del admin dueño, pero solo los que le habilitaron en
       analyst_dataset_access (tabla que gestiona el admin desde /users)
     """
     if auth["role"] == "admin":
-        result = supabase.table("datasets").select("id").eq("user_id", auth["user"].id).execute()
+        result = supabase.table("datasets").select("id").eq("user_id", auth["env_id"]).execute()
         return [d["id"] for d in (result.data or [])]
 
     owner_id = auth.get("owner_id")
@@ -98,7 +99,7 @@ def _df_to_preview_payload(df, file_name: str):
 
 @router.post("/upload")
 async def upload_dataset(file: UploadFile = File(...), auth=Depends(require_role("admin"))):
-    user = auth["user"]
+    env_id = auth["env_id"]  # el dataset queda del ENTORNO, no solo de quien lo sube
 
     if not file.filename.lower().endswith(ALLOWED_EXTENSIONS):
         raise HTTPException(status_code=400, detail="Solo se aceptan archivos .csv, .xlsx o .xls")
@@ -119,7 +120,7 @@ async def upload_dataset(file: UploadFile = File(...), auth=Depends(require_role
     settings = get_settings()
     supabase = get_supabase_admin()
 
-    storage_path = f"{user.id}/{file.filename}"
+    storage_path = f"{env_id}/{file.filename}"
 
     try:
         supabase.storage.from_(settings.datasets_bucket).upload(
@@ -134,7 +135,7 @@ async def upload_dataset(file: UploadFile = File(...), auth=Depends(require_role
         supabase.table("datasets")
         .insert(
             {
-                "user_id": user.id,
+                "user_id": env_id,
                 "file_name": file.filename,
                 "storage_path": storage_path,
                 "row_count": analysis["row_count"],
@@ -568,4 +569,3 @@ async def compare_with_external_dataset(
     result["ownFileName"] = dataset["file_name"]
     result["comparedFileName"] = file.filename
     return result
-    

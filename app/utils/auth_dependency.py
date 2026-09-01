@@ -43,9 +43,14 @@ async def require_auth(authorization: str | None = Header(default=None)):
         "role": role,
         "company": company,
         # Para un analista, owner_id es el admin dueño del sistema al que
-        # pertenece (de ahí saca sus permisos). Para un admin, es None:
-        # un admin siempre es dueño de sí mismo.
+        # pertenece (de ahí saca sus permisos). Para un admin, es None si es
+        # el admin raíz, o el id del admin raíz si fue creado por otro admin.
         "owner_id": owner_id,
+        # env_id es el id "de la empresa": el mismo valor para todas las
+        # cuentas (admins y analistas) que deben ver y compartir los mismos
+        # datasets. Si la cuenta tiene owner_id, ese ES el entorno; si no
+        # (admin raíz), el entorno es ella misma.
+        "env_id": owner_id or result.user.id,
     }
 
 
