@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 import json
 
@@ -15,7 +15,9 @@ from app.utils.data_cleaning import (
     aggregate_chart_column,
     compare_datasets_in_memory,
     compute_sales_summary,
+    build_enriched_preview,
 )
+from app.utils.df_cache import cache_get, cache_set, cache_invalidate
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
@@ -77,15 +79,26 @@ def _get_owned_dataset(supabase, dataset_id: str, auth: dict) -> dict:
 
 
 def _download_dataset_df(supabase, settings, dataset: dict):
+    # El archivo original no cambia (solo se reemplaza si se vuelve a subir,
+    # y eso siempre crea un dataset con id nuevo), así que se puede cachear
+    # con tranquilidad: mientras el id sea el mismo, los bytes también.
+    cache_key = f"raw:{dataset['id']}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
     try:
         file_bytes = supabase.storage.from_(settings.datasets_bucket).download(dataset["storage_path"])
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"No se pudo leer el archivo: {exc}")
 
     try:
-        return read_dataset(file_bytes, dataset["file_name"])
+        df = read_dataset(file_bytes, dataset["file_name"])
     except Exception:
         raise HTTPException(status_code=400, detail="No se pudo procesar el archivo")
+
+    cache_set(cache_key, df)
+    return df.copy()
 
 
 def _df_to_preview_payload(df, file_name: str):
@@ -174,7 +187,16 @@ def list_datasets(auth=Depends(require_auth)):
         .execute()
     )
 
-    return {"datasets": result.data}
+    # Una sola consulta para saber cuáles de estos datasets YA tienen una
+    # versión limpia (pasaron por "Aplicar limpieza"), para diferenciar eso
+    # de solo tener buena calidad al subir. Sin esto habría que preguntar
+    # dataset por dataset (N+1).
+    cleaned = supabase.table("cleaned_datasets").select("dataset_id").in_("dataset_id", ids).execute()
+    cleaned_ids = {row["dataset_id"] for row in (cleaned.data or [])}
+
+    datasets = [{**d, "has_cleaned_version": d["id"] in cleaned_ids} for d in result.data]
+
+    return {"datasets": datasets}
 
 
 @router.get("/stats")
@@ -224,11 +246,9 @@ def _get_cleaned_dfs(supabase, settings, dataset_ids: list[str]) -> list[pd.Data
 
     dfs: list[pd.DataFrame] = []
     for row in latest_by_dataset.values():
-        try:
-            file_bytes = supabase.storage.from_(settings.datasets_bucket).download(row["cleaned_file_path"])
-            dfs.append(pd.read_csv(io.BytesIO(file_bytes)))
-        except Exception:
-            continue
+        df = _get_latest_cleaned_df_for_dataset(supabase, settings, row["dataset_id"])
+        if df is not None:
+            dfs.append(df)
     return dfs
 
 
@@ -264,6 +284,11 @@ def _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id: str) -> p
     """Descarga la versión limpia más reciente de UN dataset puntual (no de
     todos los del usuario), para que los gráficos puedan mostrar solo el
     archivo que el usuario tiene seleccionado en el dashboard."""
+    cache_key = f"cleaned:{dataset_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
     cleaned = (
         supabase.table("cleaned_datasets")
         .select("*")
@@ -278,9 +303,12 @@ def _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id: str) -> p
     row = cleaned.data[0]
     try:
         file_bytes = supabase.storage.from_(settings.datasets_bucket).download(row["cleaned_file_path"])
-        return pd.read_csv(io.BytesIO(file_bytes))
+        df = pd.read_csv(io.BytesIO(file_bytes))
     except Exception:
         return None
+
+    cache_set(cache_key, df)
+    return df.copy()
 
 
 @router.get("/{dataset_id}/cleaned-preview")
@@ -499,6 +527,10 @@ def apply_clean_dataset(dataset_id: str, options: CleaningOptions, auth=Depends(
         {"dataset_id": dataset_id, "cleaned_file_path": cleaned_path, "status": "Procesado"}
     ).execute()
 
+    # Se acaba de crear una versión limpia nueva: hay que invalidar el caché
+    # para que la próxima lectura traiga esta versión y no la de antes.
+    cache_invalidate(f"cleaned:{dataset_id}")
+
     # Recalcular calidad/estado con los datos YA limpios y reflejarlo en el
     # dataset original: si no hacemos esto, el Dashboard, la tabla de
     # "Archivos subidos" y el donut de calidad siguen mostrando los valores
@@ -568,4 +600,62 @@ async def compare_with_external_dataset(
     result = compare_datasets_in_memory(own_df, other_df)
     result["ownFileName"] = dataset["file_name"]
     result["comparedFileName"] = file.filename
+    return result
+
+
+@router.post("/{dataset_id}/enrich-preview")
+async def enrich_dataset_preview(
+    dataset_id: str,
+    file: UploadFile = File(...),
+    join_key: str = Form(...),
+    columns: str = Form(...),
+    auth=Depends(require_role("admin", "analyst")),
+):
+    """Arma una TABLA TEMPORAL en memoria: toma tu dataset ya limpio y le
+    "pega" una o más columnas de un CSV externo (ej. la oferta del día de
+    otra sucursal), cruzando las filas por `join_key` (ej. cliente_id,
+    producto). `columns` es una lista de nombres separados por coma.
+
+    IGUAL que /compare: el CSV externo y la tabla resultante NUNCA se
+    guardan — no se sube a Storage, no se inserta en ninguna tabla. Se
+    recalcula en cada request y se descarta al responder. Así el analista
+    puede armar tablas de datos de vida corta (ofertas de un día, promos)
+    sin dejar rastro permanente en el sistema.
+    """
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    if not file.filename.lower().endswith(ALLOWED_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos .csv, .xlsx o .xls")
+
+    dataset = _get_owned_dataset(supabase, dataset_id, auth)
+    own_df = _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id)
+    if own_df is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Este dataset todavía no tiene una versión limpia. Límpialo primero.",
+        )
+
+    file_bytes = await file.read()
+    try:
+        other_df = read_dataset(file_bytes, file.filename)
+    except Exception:
+        raise HTTPException(status_code=400, detail="No se pudo leer el archivo a combinar.")
+
+    if other_df.empty:
+        raise HTTPException(status_code=400, detail="El archivo a combinar no contiene filas")
+
+    bring_columns = [c.strip() for c in columns.split(",") if c.strip()]
+    if not bring_columns:
+        raise HTTPException(status_code=400, detail="Elige al menos una columna para traer")
+
+    result = build_enriched_preview(own_df, other_df, join_key, bring_columns)
+    if result is None:
+        raise HTTPException(
+            status_code=400, detail="La columna clave elegida no existe en ambos archivos"
+        )
+
+    result["ownFileName"] = dataset["file_name"]
+    result["comparedFileName"] = file.filename
+    result["joinKey"] = join_key
     return result

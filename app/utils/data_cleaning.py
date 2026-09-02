@@ -253,6 +253,134 @@ def aggregate_chart_column(dfs: list[pd.DataFrame], column: str, bins: int = 8, 
     return {"column": column, "type": "categorical", "data": data}
 
 
+def _detect_join_key_candidates(own_df: pd.DataFrame, other_df: pd.DataFrame, min_match_pct: float = 15.0) -> list[dict]:
+    """Busca columnas que existen en AMBOS DataFrames (por nombre) y mide
+    qué tanto se superponen sus valores reales, para sugerir cuál usar como
+    "clave" al cruzar las filas de los dos datasets (ej. cliente_id,
+    producto). Un nombre de columna igual no basta si el contenido no tiene
+    nada que ver: por eso se exige un mínimo de coincidencia real.
+
+    Además, prioriza columnas que de verdad IDENTIFICAN una fila (valores
+    poco repetidos, ej. cliente_id) sobre columnas categóricas de pocos
+    valores (ej. producto, categoria): usar una columna muy repetida como
+    clave hace que cada fila se cruce con decenas de filas del otro
+    archivo ("fan-out"), lo que arruina cualquier cálculo posterior.
+    """
+    own_cols = {str(c).strip().lower(): c for c in own_df.columns}
+    other_cols = {str(c).strip().lower(): c for c in other_df.columns}
+    shared = [key for key in own_cols if key in other_cols]
+
+    candidates = []
+    for key in shared:
+        own_col = own_df[own_cols[key]].dropna().astype(str).str.strip()
+        other_col = other_df[other_cols[key]].dropna().astype(str).str.strip()
+        if own_col.empty or other_col.empty:
+            continue
+
+        own_values = set(own_col)
+        other_values = set(other_col)
+        overlap = own_values & other_values
+        if not overlap:
+            continue
+
+        match_pct = round(len(overlap) / len(other_values) * 100, 1)
+        if match_pct < min_match_pct:
+            continue
+
+        # qué tan "identificatoria" es esta columna en tu propio dataset:
+        # cerca de 1.0 = casi cada fila tiene un valor distinto (buena
+        # clave); cerca de 0 = muy pocos valores repetidos muchas veces
+        # (mala clave, ej. una categoría).
+        uniqueness = round(len(own_values) / len(own_col), 3)
+
+        candidates.append(
+            {
+                "column": own_cols[key],
+                "match_pct": match_pct,
+                "own_unique_values": len(own_values),
+                "other_unique_values": len(other_values),
+                "uniqueness": uniqueness,
+            }
+        )
+
+    # candidatas "buenas" primero (identifican filas puntuales), y entre
+    # ellas, mejor coincidencia primero. Solo si NINGUNA columna compartida
+    # es razonablemente identificatoria, se cae a mostrar todas ordenadas
+    # solo por coincidencia (mejor tener algo que nada).
+    good = [c for c in candidates if c["uniqueness"] >= 0.15]
+    pool = good if good else candidates
+    pool.sort(key=lambda c: (-c["uniqueness"], -c["match_pct"]))
+
+    for c in pool:
+        del c["uniqueness"]  # detalle interno, no hace falta mandarlo al frontend
+    return pool
+
+
+def build_enriched_preview(
+    own_df: pd.DataFrame,
+    other_df: pd.DataFrame,
+    join_key: str,
+    bring_columns: list[str],
+    row_limit: int = 50,
+) -> dict | None:
+    """Arma una tabla TEMPORAL en memoria: le "pega" a `own_df` una o más
+    columnas de `other_df` (ej. la oferta del día de otro CSV), cruzando las
+    filas por `join_key` (ej. cliente_id, producto). Ninguno de los dos
+    DataFrames originales se modifica, y nada de esto se persiste — se
+    recalcula en cada request y se descarta al responder. Devuelve None si
+    la columna clave no existe en ambos archivos.
+    """
+    own_cols_norm = {str(c).strip().lower(): c for c in own_df.columns}
+    other_cols_norm = {str(c).strip().lower(): c for c in other_df.columns}
+
+    key_norm = join_key.strip().lower()
+    if key_norm not in own_cols_norm or key_norm not in other_cols_norm:
+        return None
+
+    own_key = own_cols_norm[key_norm]
+    other_key = other_cols_norm[key_norm]
+
+    valid_bring = [c for c in bring_columns if c in other_df.columns]
+    if not valid_bring:
+        return None
+
+    left = own_df.copy()
+    right = other_df[[other_key, *valid_bring]].copy()
+
+    # Normaliza la clave a texto para poder cruzar aunque un archivo la
+    # tenga como número y el otro como texto (ej. 1037 vs "1037").
+    left["_join_key"] = left[own_key].astype(str).str.strip()
+    right["_join_key"] = right[other_key].astype(str).str.strip()
+    right = right.drop_duplicates(subset="_join_key", keep="first")
+
+    # Si alguna de las columnas a traer ya existe con ese nombre, no la pisa:
+    # la agrega con un sufijo para dejar claro que es la version temporal.
+    rename_map: dict[str, str] = {}
+    for col in valid_bring:
+        final_name = col if col not in own_df.columns else f"{col} (temporal)"
+        n = 2
+        while final_name in own_df.columns or final_name in rename_map.values():
+            final_name = f"{col} (temporal {n})"
+            n += 1
+        rename_map[col] = final_name
+
+    right = right.rename(columns=rename_map)
+    added_names = list(rename_map.values())
+
+    merged = left.merge(right[["_join_key", *added_names]], on="_join_key", how="left")
+    merged = merged.drop(columns=["_join_key"])
+
+    matched_rows = int(merged[added_names[0]].notna().sum()) if added_names else 0
+
+    return {
+        "columns": [str(c) for c in merged.columns],
+        "addedColumns": added_names,
+        "totalRows": int(merged.shape[0]),
+        "matchedRows": matched_rows,
+        "rows": json.loads(merged.head(row_limit).to_json(orient="records", date_format="iso")),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Comparación entre empresas del mismo rubro (benchmarking)
 #
@@ -366,9 +494,17 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
     farmacia) y genera una recomendación simple:
 
     1. Detecta qué columnas tiene 'other_df' que 'own_df' NO tiene.
-    2. Si en 'other_df' existe una columna de ventas, calcula si las filas
-       donde la columna extra está "activa" (no nula / valor truthy) tienen
-       en promedio más ventas que las filas donde no está.
+    2. Mide si esas columnas se asocian a mayores ventas, de DOS formas
+       (usa la que se pueda):
+       a) Cruzando filas por una columna clave en común (ej. cliente_id) y
+          comparando TUS ventas históricas (own_df) entre las filas que sí
+          tienen la columna extra vs las que no. Esto sirve para archivos
+          "livianos" que no traen su propia columna de ventas — como una
+          lista de ofertas del día — que es el caso más común.
+       b) Si no hay clave en común, cae al método anterior: busca una
+          columna de ventas DENTRO del archivo externo y compara ahí mismo
+          (útil cuando comparas dos datasets completos de ventas, ej. tu
+          farmacia vs la farmacia competencia).
     3. Devuelve columnas extra + recomendación en texto, listo para mostrar
        en el frontend del analista.
 
@@ -380,23 +516,66 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
 
     extra_columns = [c for c in other_columns if c.strip().lower() not in own_columns]
 
-    sales_col = _find_sales_column(other_df)
+    join_key_candidates = _detect_join_key_candidates(own_df, other_df)
+    own_sales_col = _find_sales_column(own_df)
+    other_sales_col = _find_sales_column(other_df)
+
+    # Si hay una clave en común Y tu propio dataset tiene una columna de
+    # ventas, armamos UNA vez la tabla cruzada y la reusamos para medir el
+    # impacto de cada columna extra contra TUS ventas reales.
+    merged_for_impact = None
+    if join_key_candidates and own_sales_col is not None:
+        best_key = join_key_candidates[0]["column"]
+        own_key_col = next((c for c in own_df.columns if str(c).strip().lower() == best_key.strip().lower()), None)
+        other_key_col = next((c for c in other_df.columns if str(c).strip().lower() == best_key.strip().lower()), None)
+        if own_key_col is not None and other_key_col is not None:
+            left = own_df[[own_key_col, own_sales_col]].copy()
+            left["_join_key"] = left[own_key_col].astype(str).str.strip()
+            right = other_df.copy()
+            right["_join_key"] = right[other_key_col].astype(str).str.strip()
+            merged_for_impact = left.merge(right, on="_join_key", how="left", suffixes=("", "_otro"))
+
+    def _has_value(series: pd.Series) -> pd.Series:
+        has_value = series.notna()
+        # columnas booleanas/texto tipo "si/no" también cuentan como activas
+        if series.dtype == object:
+            has_value = series.astype(str).str.strip().str.lower().isin(
+                ["si", "sí", "yes", "true", "1", "x"]
+            ) | (series.notna() & (series.astype(str).str.strip() != ""))
+        return has_value
 
     recommendations = []
     for col in extra_columns:
         entry = {"column": col, "impact_pct": None, "message": None}
 
-        if sales_col is not None:
-            series = other_df[col]
-            has_value = series.notna()
-            # columnas booleanas/texto tipo "si/no" también cuentan como activas
-            if series.dtype == object:
-                has_value = series.astype(str).str.strip().str.lower().isin(
-                    ["si", "sí", "yes", "true", "1", "x"]
-                ) | (series.notna() & (series.astype(str).str.strip() != ""))
+        # Método A: cruzando por clave, contra TUS ventas históricas.
+        if merged_for_impact is not None and col in merged_for_impact.columns:
+            has_value = _has_value(merged_for_impact[col])
+            with_col = merged_for_impact.loc[has_value, own_sales_col].dropna()
+            without_col = merged_for_impact.loc[~has_value, own_sales_col].dropna()
 
-            with_col = other_df.loc[has_value, sales_col].dropna()
-            without_col = other_df.loc[~has_value, sales_col].dropna()
+            if len(with_col) > 0 and len(without_col) > 0:
+                avg_with = float(with_col.mean())
+                avg_without = float(without_col.mean())
+                if avg_without > 0:
+                    impact_pct = round(((avg_with - avg_without) / avg_without) * 100, 1)
+                    entry["impact_pct"] = impact_pct
+                    if impact_pct > 0:
+                        entry["message"] = (
+                            f"En tus ventas históricas, las filas que cruzan con '{col}' "
+                            f"muestran un promedio {impact_pct}% mayor. Te recomendamos incorporar esta columna."
+                        )
+                    else:
+                        entry["message"] = (
+                            f"En tus ventas históricas, '{col}' no muestra una mejora clara "
+                            f"({impact_pct}%). No es prioritario incorporarla."
+                        )
+
+        # Método B (respaldo): columna de ventas dentro del archivo externo.
+        if entry["message"] is None and other_sales_col is not None:
+            has_value = _has_value(other_df[col])
+            with_col = other_df.loc[has_value, other_sales_col].dropna()
+            without_col = other_df.loc[~has_value, other_sales_col].dropna()
 
             if len(with_col) > 0 and len(without_col) > 0:
                 avg_with = float(with_col.mean())
@@ -430,6 +609,10 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
         "own_columns": sorted(own_columns),
         "other_columns": other_columns,
         "extra_columns": extra_columns,
-        "sales_column_detected": sales_col,
+        "sales_column_detected": own_sales_col or other_sales_col,
         "recommendations": recommendations,
+        # Columnas candidatas para cruzar filas entre ambos datasets (ej.
+        # cliente_id, producto), usadas por la función de "traer columna" /
+        # tabla temporal.
+        "join_key_candidates": join_key_candidates,
     }
