@@ -544,9 +544,50 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
             ) | (series.notna() & (series.astype(str).str.strip() != ""))
         return has_value
 
+    # Columnas con una clave de cruce ya sugerida (match_pct >= umbral),
+    # usado para saber si una recomendación es fácil de aplicar o no.
+    join_key_columns_available = {c["column"].strip().lower() for c in join_key_candidates}
+
+    def _priority_from_impact(impact_pct: float | None) -> str:
+        """Clasifica el impacto en una prioridad legible para el analista."""
+        if impact_pct is None or impact_pct <= 0:
+            return "baja"
+        if impact_pct > 15:
+            return "alta"
+        if impact_pct >= 5:
+            return "media"
+        return "baja"
+
+    def _explain_cause(col: str, impact_pct: float) -> str:
+        """Arma una frase de 'por qué' según el nombre/tipo de columna,
+        en vez de mostrar solo el porcentaje en seco."""
+        col_lower = col.strip().lower()
+        if any(k in col_lower for k in ["oferta", "promo", "descuento", "cupon"]):
+            causa = "probablemente porque incentiva a los clientes a comprar más o a decidirse más rápido"
+        elif any(k in col_lower for k in ["fideliz", "membres", "club", "puntos"]):
+            causa = "probablemente porque estos clientes tienen una relación más constante con el negocio"
+        elif any(k in col_lower for k in ["categoria", "tipo", "linea", "familia"]):
+            causa = "probablemente porque agrupa productos que por su naturaleza generan más ingreso por venta"
+        elif any(k in col_lower for k in ["region", "zona", "sucursal", "ciudad", "distrito"]):
+            causa = "probablemente porque refleja diferencias de demanda entre ubicaciones"
+        elif any(k in col_lower for k in ["canal", "medio", "plataforma"]):
+            causa = "probablemente porque ese canal atrae compras de mayor valor"
+        else:
+            causa = "aunque el motivo exacto conviene validarlo con más contexto del negocio"
+
+        if impact_pct > 0:
+            return (
+                f"Las ventas suben {impact_pct}% cuando el registro tiene '{col}', "
+                f"lo que sugiere que esta variable está asociada a mayor gasto — {causa}."
+            )
+        return (
+            f"'{col}' no muestra una asociación clara con mayores ventas ({impact_pct}%), "
+            "por lo que no parece ser un factor relevante para explicar diferencias de ingreso."
+        )
+
     recommendations = []
     for col in extra_columns:
-        entry = {"column": col, "impact_pct": None, "message": None}
+        entry = {"column": col, "impact_pct": None, "priority": "baja", "message": None, "method": None}
 
         # Método A: cruzando por clave, contra TUS ventas históricas.
         if merged_for_impact is not None and col in merged_for_impact.columns:
@@ -560,16 +601,8 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
                 if avg_without > 0:
                     impact_pct = round(((avg_with - avg_without) / avg_without) * 100, 1)
                     entry["impact_pct"] = impact_pct
-                    if impact_pct > 0:
-                        entry["message"] = (
-                            f"En tus ventas históricas, las filas que cruzan con '{col}' "
-                            f"muestran un promedio {impact_pct}% mayor. Te recomendamos incorporar esta columna."
-                        )
-                    else:
-                        entry["message"] = (
-                            f"En tus ventas históricas, '{col}' no muestra una mejora clara "
-                            f"({impact_pct}%). No es prioritario incorporarla."
-                        )
+                    entry["method"] = "cruce_historico"
+                    entry["message"] = _explain_cause(col, impact_pct)
 
         # Método B (respaldo): columna de ventas dentro del archivo externo.
         if entry["message"] is None and other_sales_col is not None:
@@ -583,16 +616,8 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
                 if avg_without > 0:
                     impact_pct = round(((avg_with - avg_without) / avg_without) * 100, 1)
                     entry["impact_pct"] = impact_pct
-                    if impact_pct > 0:
-                        entry["message"] = (
-                            f"Las filas con '{col}' muestran un promedio de ventas "
-                            f"{impact_pct}% mayor. Te recomendamos incorporar esta columna."
-                        )
-                    else:
-                        entry["message"] = (
-                            f"'{col}' no muestra una mejora clara en ventas "
-                            f"({impact_pct}%). No es prioritario incorporarla."
-                        )
+                    entry["method"] = "archivo_externo"
+                    entry["message"] = _explain_cause(col, impact_pct)
 
         if entry["message"] is None:
             entry["message"] = (
@@ -600,10 +625,63 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
                 "pero no se encontró una columna de ventas para medir su impacto."
             )
 
+        entry["priority"] = _priority_from_impact(entry["impact_pct"])
+        # Una recomendación es "fácil de aplicar" si ya existe (al menos)
+        # una clave de cruce sugerida entre ambos datasets para traerla a
+        # tu tabla con el botón "Agregar a mi tabla".
+        entry["easy_to_apply"] = bool(join_key_columns_available)
         recommendations.append(entry)
 
     # ordena mostrando primero las de mayor impacto positivo
     recommendations.sort(key=lambda r: (r["impact_pct"] is None, -(r["impact_pct"] or 0)))
+
+    # --- Resumen ejecutivo -------------------------------------------------
+    positive_recs = [r for r in recommendations if r["impact_pct"] is not None and r["impact_pct"] > 0]
+    top_recs = positive_recs[:3]
+
+    if not extra_columns:
+        headline = "La otra empresa no tiene columnas adicionales: no hay nuevas variables que evaluar por ahora."
+    elif not positive_recs:
+        headline = (
+            f"Se detectaron {len(extra_columns)} columna(s) nueva(s), pero ninguna muestra una asociación "
+            "clara con mayores ventas. Por ahora no se recomienda priorizar su incorporación."
+        )
+    else:
+        top = top_recs[0]
+        columnas_top = " y ".join(f"'{r['column']}'" for r in top_recs[:2])
+        headline = (
+            f"De {len(extra_columns)} columna(s) nueva(s) detectadas, {columnas_top} "
+            f"muestra{'n' if len(top_recs[:2]) > 1 else ''} el mayor impacto en ventas "
+            f"(+{top['impact_pct']}% la más fuerte). Se recomienda priorizar su incorporación "
+            "para mejorar la toma de decisiones comerciales."
+        )
+
+    priority_recommendation = None
+    if top_recs:
+        best = top_recs[0]
+        accion = (
+            f"Prioriza incorporar '{best['column']}' — es la que más impacto tendría en tus ventas "
+            f"(+{best['impact_pct']}%)"
+        )
+        if best.get("easy_to_apply") and join_key_candidates:
+            accion += f", y ya se detectó una columna clave ('{join_key_candidates[0]['column']}') para cruzarla fácilmente con tu tabla."
+        else:
+            accion += "."
+        priority_recommendation = {
+            "column": best["column"],
+            "impact_pct": best["impact_pct"],
+            "priority": best["priority"],
+            "action": accion,
+        }
+
+    executive_summary = {
+        "headline": headline,
+        "top_recommendations": [
+            {"column": r["column"], "impact_pct": r["impact_pct"], "priority": r["priority"]}
+            for r in top_recs
+        ],
+        "priority_recommendation": priority_recommendation,
+    }
 
     return {
         "own_columns": sorted(own_columns),
@@ -611,6 +689,7 @@ def compare_datasets_in_memory(own_df: pd.DataFrame, other_df: pd.DataFrame) -> 
         "extra_columns": extra_columns,
         "sales_column_detected": own_sales_col or other_sales_col,
         "recommendations": recommendations,
+        "executive_summary": executive_summary,
         # Columnas candidatas para cruzar filas entre ambos datasets (ej.
         # cliente_id, producto), usadas por la función de "traer columna" /
         # tabla temporal.
