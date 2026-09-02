@@ -4,6 +4,36 @@ import numpy as np
 import pandas as pd
 
 
+def parse_mixed_dates(series: pd.Series) -> pd.Series:
+    """Convierte una columna de texto con fechas a datetime, soportando que
+    el mismo archivo mezcle formatos ISO ('2026-01-07') y DD/MM/YYYY
+    ('11/01/2026').
+
+    OJO: pd.to_datetime(..., format="mixed", dayfirst=True) NO sirve para
+    esto — pandas le aplica "día primero" también a las fechas ISO (que no
+    lo necesitan porque YYYY-MM-DD no es ambiguo) e invierte mes/día por
+    error (ej. '2026-01-07' termina en 1 de julio en vez de 7 de enero).
+
+    Por eso cada valor se clasifica por su patrón antes de parsear:
+    - 'YYYY-MM-DD' -> se parsea SIN dayfirst (el orden ya es explícito).
+    - 'DD/MM/YYYY' (u otro con '/') -> se parsea CON dayfirst=True.
+    - cualquier otro formato -> fallback genérico con dayfirst=True.
+    """
+    text = series.astype(str).str.strip()
+    iso_mask = text.str.match(r"^\d{4}-\d{1,2}-\d{1,2}$")
+    slash_mask = text.str.match(r"^\d{1,2}/\d{1,2}/\d{4}$")
+    other_mask = ~iso_mask & ~slash_mask
+
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if iso_mask.any():
+        result.loc[iso_mask] = pd.to_datetime(text[iso_mask], format="%Y-%m-%d", errors="coerce")
+    if slash_mask.any():
+        result.loc[slash_mask] = pd.to_datetime(text[slash_mask], format="%d/%m/%Y", errors="coerce")
+    if other_mask.any():
+        result.loc[other_mask] = pd.to_datetime(text[other_mask], errors="coerce", dayfirst=True)
+    return result
+
+
 def read_dataset(file_bytes: bytes, file_name: str) -> pd.DataFrame:
     """Lee un CSV o Excel a un DataFrame de pandas."""
     if file_name.lower().endswith((".xlsx", ".xls")):
@@ -186,7 +216,7 @@ def clean_dataset_with_options(df: pd.DataFrame, options: dict) -> tuple[pd.Data
             if numeric_like.notna().mean() > 0.5:
                 continue
 
-            converted = pd.to_datetime(working[col], errors="coerce", format="mixed", dayfirst=True)
+            converted = parse_mixed_dates(working[col])
             if converted.notna().sum() > 0:
                 working[col] = converted.dt.strftime("%Y-%m-%d").where(converted.notna(), working[col])
 
@@ -461,10 +491,11 @@ def compute_sales_summary(df: pd.DataFrame) -> dict | None:
 
     monthly: list[dict] = []
     trend_pct = None
+    has_daily_detail = False
     date_col = _find_date_column(df)
     if date_col is not None:
         working = df[[date_col, sales_col]].copy()
-        working[date_col] = pd.to_datetime(working[date_col], errors="coerce", format="mixed", dayfirst=True)
+        working[date_col] = parse_mixed_dates(working[date_col])
         working[sales_col] = pd.to_numeric(working[sales_col], errors="coerce")
         working = working.dropna()
         if not working.empty:
@@ -476,6 +507,14 @@ def compute_sales_summary(df: pd.DataFrame) -> dict | None:
                 if prev > 0:
                     trend_pct = round(((last - prev) / prev) * 100, 1)
 
+            # El dataset "tiene detalle diario" si, dentro de al menos un
+            # mes, existe más de un día calendario distinto. Si cada mes
+            # solo trae una fecha (o todas caen en el mismo día), no hay
+            # nada que desglosar por día y el frontend debe quedarse solo
+            # con la vista mensual.
+            days_per_month = working.groupby("month")[date_col].apply(lambda s: s.dt.day.nunique())
+            has_daily_detail = bool((days_per_month > 1).any())
+
     return {
         "sales_column": str(sales_col),
         "date_column": str(date_col) if date_col is not None else None,
@@ -486,6 +525,59 @@ def compute_sales_summary(df: pd.DataFrame) -> dict | None:
         "top_category": top_category,
         "monthly": monthly,
         "trend_pct": trend_pct,
+        "has_daily_detail": has_daily_detail,
+    }
+
+
+def compute_period_breakdown(df: pd.DataFrame, month: str | None = None, day: str | None = None) -> dict | None:
+    """Desglose para un periodo específico de la pestaña Ventas:
+
+    - Si se pasa `month` (formato 'YYYY-MM') y el dataset tiene detalle
+      diario, devuelve las ventas día a día de ESE mes ('daily_points').
+    - Devuelve siempre el desglose por categoría ('categories') filtrado
+      al periodo pedido: todo el dataset si no se pasa `month`, solo ese
+      mes si se pasa `month`, o solo ese día si además se pasa `day`
+      (formato 'YYYY-MM-DD').
+
+    Devuelve None si no se pudo identificar una columna de monto.
+    """
+    sales_col = _find_sales_column(df)
+    if sales_col is None:
+        return None
+
+    date_col = _find_date_column(df)
+    category_col = _find_category_column(df)
+
+    working = df.copy()
+    working[sales_col] = pd.to_numeric(working[sales_col], errors="coerce")
+
+    if date_col is not None:
+        working[date_col] = parse_mixed_dates(working[date_col])
+
+    scoped = working.dropna(subset=[sales_col])
+
+    if date_col is not None and month:
+        scoped = scoped.dropna(subset=[date_col])
+        scoped = scoped[scoped[date_col].dt.to_period("M").astype(str) == month]
+        if day:
+            scoped = scoped[scoped[date_col].dt.date.astype(str) == day]
+
+    daily_points = None
+    if date_col is not None and month and not day:
+        month_rows = scoped.dropna(subset=[date_col])
+        if not month_rows.empty:
+            daily_totals = month_rows.groupby(month_rows[date_col].dt.date)[sales_col].sum().sort_index()
+            daily_points = [{"day": str(d), "total": float(v)} for d, v in daily_totals.items()]
+
+    categories = None
+    if category_col is not None:
+        grouped = scoped.groupby(category_col)[sales_col].sum(numeric_only=True).sort_values(ascending=False)
+        grouped = grouped.dropna()
+        categories = [{"name": str(name), "total": float(v)} for name, v in grouped.items()]
+
+    return {
+        "daily_points": daily_points,
+        "categories": categories,
     }
 
 

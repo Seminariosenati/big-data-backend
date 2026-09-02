@@ -15,6 +15,7 @@ from app.utils.data_cleaning import (
     aggregate_chart_column,
     compare_datasets_in_memory,
     compute_sales_summary,
+    compute_period_breakdown,
     build_enriched_preview,
 )
 from app.utils.df_cache import cache_get, cache_set, cache_invalidate
@@ -382,6 +383,41 @@ def get_sales_summary_for_dataset(dataset_id: str, auth=Depends(require_auth)):
             detail="No se encontró una columna de monto reconocible (ventas, monto, importe, total, etc.) en este dataset",
         )
     return summary
+
+
+@router.get("/{dataset_id}/sales-summary/period")
+def get_sales_period_breakdown(
+    dataset_id: str,
+    month: str | None = None,
+    day: str | None = None,
+    auth=Depends(require_auth),
+):
+    """Desglose de ventas para un periodo puntual de la pestaña Ventas:
+
+    - `month` (ej. '2026-02'): si el dataset tiene detalle diario, además
+      devuelve las ventas día a día de ese mes.
+    - `day` (ej. '2026-02-14', opcional, requiere `month`): acota el
+      desglose por categoría a ese día exacto.
+
+    Sin `month`, el desglose por categoría cubre todo el dataset. Se usa
+    para alimentar el gráfico de dona de categorías cuando el usuario
+    cambia el filtro de mes/día en 'Evolución de Ventas'.
+    """
+    supabase = get_supabase_admin()
+    settings = get_settings()
+
+    _get_owned_dataset(supabase, dataset_id, auth)
+    df = _get_latest_cleaned_df_for_dataset(supabase, settings, dataset_id)
+    if df is None:
+        raise HTTPException(status_code=404, detail="Este dataset todavía no tiene una versión limpia")
+
+    result = compute_period_breakdown(df, month=month, day=day)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontró una columna de monto reconocible en este dataset",
+        )
+    return result
 
 
 @router.get("/{dataset_id}/charts/raw/columns")
