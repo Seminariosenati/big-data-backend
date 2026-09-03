@@ -302,8 +302,8 @@ def _detect_join_key_candidates(own_df: pd.DataFrame, other_df: pd.DataFrame, mi
 
     candidates = []
     for key in shared:
-        own_col = own_df[own_cols[key]].dropna().astype(str).str.strip()
-        other_col = other_df[other_cols[key]].dropna().astype(str).str.strip()
+        own_col = own_df[own_cols[key]].dropna().astype(str).str.strip().str.lower()
+        other_col = other_df[other_cols[key]].dropna().astype(str).str.strip().str.lower()
         if own_col.empty or other_col.empty:
             continue
 
@@ -379,8 +379,8 @@ def build_enriched_preview(
 
     # Normaliza la clave a texto para poder cruzar aunque un archivo la
     # tenga como número y el otro como texto (ej. 1037 vs "1037").
-    left["_join_key"] = left[own_key].astype(str).str.strip()
-    right["_join_key"] = right[other_key].astype(str).str.strip()
+    left["_join_key"] = left[own_key].astype(str).str.strip().str.lower()
+    right["_join_key"] = right[other_key].astype(str).str.strip().str.lower()
     right = right.drop_duplicates(subset="_join_key", keep="first")
 
     # Si alguna de las columnas a traer ya existe con ese nombre, no la pisa:
@@ -402,12 +402,21 @@ def build_enriched_preview(
 
     matched_rows = int(merged[added_names[0]].notna().sum()) if added_names else 0
 
+    # KPIs recalculados sobre la tabla combinada completa (no solo el
+    # preview de `row_limit` filas) — igual que el resto de esta función,
+    # esto vive únicamente en memoria durante el request y se descarta al
+    # responder. Si no se puede detectar una columna de monto reconocible
+    # en `merged`, se omite (el frontend cae de vuelta a los KPIs del
+    # dataset guardado).
+    enriched_summary = compute_sales_summary(merged)
+
     return {
         "columns": [str(c) for c in merged.columns],
         "addedColumns": added_names,
         "totalRows": int(merged.shape[0]),
         "matchedRows": matched_rows,
         "rows": json.loads(merged.head(row_limit).to_json(orient="records", date_format="iso")),
+        "summary": enriched_summary,
     }
 
 
