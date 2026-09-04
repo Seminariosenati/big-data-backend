@@ -30,7 +30,7 @@ class Settings:
     otp_length: int = int(os.environ.get("OTP_LENGTH", 6))
     otp_expiration_minutes: int = int(os.environ.get("OTP_EXPIRATION_MINUTES", 10))
     otp_max_attempts: int = int(os.environ.get("OTP_MAX_ATTEMPTS", 5))
-
+    admin_email: str = os.environ.get("ADMIN_EMAIL") or os.environ.get("SMTP_USER", "")
     datasets_bucket: str = os.environ.get("DATASETS_BUCKET", "datasets")
 
 
