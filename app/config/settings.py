@@ -26,6 +26,7 @@ class Settings:
     emailjs_template_id: str = os.environ.get("EMAILJS_TEMPLATE_ID", "")
     emailjs_public_key: str = os.environ.get("EMAILJS_PUBLIC_KEY", "")
     emailjs_private_key: str = os.environ.get("EMAILJS_PRIVATE_KEY", "")
+    emailjs_invitation_template_id: str = os.environ.get("EMAILJS_INVITATION_TEMPLATE_ID", "")
 
     otp_enabled: bool = os.environ.get("OTP_ENABLED", "true").lower() not in ("false", "0", "no")
     otp_length: int = int(os.environ.get("OTP_LENGTH", 6))

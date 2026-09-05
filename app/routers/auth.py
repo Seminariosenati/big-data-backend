@@ -101,7 +101,7 @@ def login(payload: LoginInput, background_tasks: BackgroundTasks):
     if not auth_response or not auth_response.session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Correo o contraseña incorrectos")
 
-        user_id = auth_response.user.id
+    user_id = auth_response.user.id
     access_token = auth_response.session.access_token
     refresh_token = auth_response.session.refresh_token
 
@@ -378,6 +378,29 @@ def _ensure_auth_user(supabase_admin, email: str) -> tuple[str, str]:
     )
     user_id = result.user.id
 
+    # Revisa si este correo tiene invitaciones pendientes (creadas desde el
+    # panel de admin). Si las hay, el rol del perfil y el acceso a proyectos
+    # vienen de ahí. Si no hay ninguna (ej. el ADMIN_EMAIL entrando por
+    # primera vez), se asume 'admin' para no romper el flujo actual.
+    role = "admin"
+    project_ids: list[str] = []
+    invitations: list[dict] = []
+    try:
+        inv = (
+            supabase_admin.table("access_invitations")
+            .select("id, project_id, type")
+            .eq("email", email_l)
+            .eq("used", False)
+            .execute()
+        )
+        invitations = inv.data or []
+        if invitations:
+            role = invitations[0].get("type") or "analyst"
+            project_ids = [row["project_id"] for row in invitations if row.get("project_id")]
+    except Exception:
+        logger.exception("No se pudieron leer invitaciones para %s", email_l)
+        invitations = []
+
     try:
         existing_profile = (
             supabase_admin.table("profiles").select("id").eq("id", user_id).limit(1).execute()
@@ -387,11 +410,27 @@ def _ensure_auth_user(supabase_admin, email: str) -> tuple[str, str]:
                 {
                     "id": user_id,
                     "full_name": email_l.split("@")[0],
-                    "role": "admin",
+                    "role": role,
                 }
             ).execute()
     except Exception:
         logger.exception("No se pudo crear profile para %s", email_l)
+
+    for project_id in project_ids:
+        try:
+            supabase_admin.table("project_access").insert(
+                {"project_id": project_id, "user_id": user_id, "role": role}
+            ).execute()
+        except Exception:
+            logger.exception("No se pudo dar acceso al proyecto %s para %s", project_id, email_l)
+
+    if invitations:
+        try:
+            supabase_admin.table("access_invitations").update({"used": True}).eq(
+                "email", email_l
+            ).eq("used", False).execute()
+        except Exception:
+            pass
 
     try:
         supabase_admin.table("pending_signups").update({"status": "approved"}).eq(
