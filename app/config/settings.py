@@ -27,6 +27,7 @@ class Settings:
     emailjs_public_key: str = os.environ.get("EMAILJS_PUBLIC_KEY", "")
     emailjs_private_key: str = os.environ.get("EMAILJS_PRIVATE_KEY", "")
 
+    otp_enabled: bool = os.environ.get("OTP_ENABLED", "true").lower() not in ("false", "0", "no")
     otp_length: int = int(os.environ.get("OTP_LENGTH", 6))
     otp_expiration_minutes: int = int(os.environ.get("OTP_EXPIRATION_MINUTES", 10))
     otp_max_attempts: int = int(os.environ.get("OTP_MAX_ATTEMPTS", 5))

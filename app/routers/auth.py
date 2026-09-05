@@ -101,9 +101,17 @@ def login(payload: LoginInput, background_tasks: BackgroundTasks):
     if not auth_response or not auth_response.session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Correo o contraseña incorrectos")
 
-    user_id = auth_response.user.id
+        user_id = auth_response.user.id
     access_token = auth_response.session.access_token
     refresh_token = auth_response.session.refresh_token
+
+    if not settings.otp_enabled:
+        return {
+            "message": "Sesión iniciada (OTP desactivado)",
+            "email": payload.email,
+            "requiresOtp": False,
+            "session": {"access_token": access_token, "refresh_token": refresh_token},
+        }
 
     # Invalida OTPs anteriores no consumidos
     supabase_admin.table("login_otps").update(
@@ -433,6 +441,19 @@ def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
 
     access_token = auth_response.session.access_token
     refresh_token = auth_response.session.refresh_token
+
+    if not settings.otp_enabled:
+        # Modo local/desarrollo: se salta el OTP para no gastar envíos de correo.
+        return {
+            "message": "Sesión iniciada (OTP desactivado)",
+            "email": email_l,
+            "requiresOtp": False,
+            "otpDestination": "admin",
+            "session": {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+        }
 
     supabase_admin.table("login_otps").update(
         {"consumed_at": datetime.now(timezone.utc).isoformat()}
