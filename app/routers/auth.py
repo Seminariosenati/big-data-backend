@@ -105,6 +105,14 @@ def login(payload: LoginInput, background_tasks: BackgroundTasks):
     access_token = auth_response.session.access_token
     refresh_token = auth_response.session.refresh_token
 
+    if not settings.otp_enabled:
+        return {
+            "message": "Sesión iniciada (OTP desactivado)",
+            "email": payload.email,
+            "requiresOtp": False,
+            "session": {"access_token": access_token, "refresh_token": refresh_token},
+        }
+
     # Invalida OTPs anteriores no consumidos
     supabase_admin.table("login_otps").update(
         {"consumed_at": datetime.now(timezone.utc).isoformat()}
@@ -244,3 +252,314 @@ def refresh_session(payload: RefreshInput):
             "refresh_token": auth_response.session.refresh_token,
         }
     }
+
+
+# ---------------------------------------------------------
+# PORTAL: login solo con correo (sin contraseña)
+# El OTP se envía al ADMIN_EMAIL. Solo correos en whitelist
+# (pending_signups aprobados, profiles existentes, o
+# invitaciones válidas) pueden solicitar acceso.
+# ---------------------------------------------------------
+
+class PortalLoginInput(BaseModel):
+    email: EmailStr
+
+
+def _find_auth_user_by_email(supabase_admin, email: str):
+    """Busca un usuario de auth por email. Devuelve el objeto user o None."""
+    email_l = email.lower().strip()
+    try:
+        getter = getattr(supabase_admin.auth.admin, "get_user_by_email", None)
+        if callable(getter):
+            res = getter(email_l)
+            user = getattr(res, "user", res)
+            if user and getattr(user, "email", None):
+                return user
+    except Exception:
+        pass
+
+    try:
+        page = supabase_admin.auth.admin.list_users()
+        iterable = page.users if hasattr(page, "users") else (page or [])
+        for u in iterable:
+            if getattr(u, "email", None) and u.email.lower() == email_l:
+                return u
+    except Exception:
+        logger.exception("list_users falló buscando %s", email_l)
+    return None
+
+
+def _is_email_whitelisted(supabase_admin, email: str) -> tuple[bool, str | None]:
+    """Devuelve (allowed, user_id_si_existe)."""
+    email_l = email.lower().strip()
+    settings = get_settings()
+    if settings.admin_email and email_l == settings.admin_email.lower().strip():
+        return True, None
+
+    matched = _find_auth_user_by_email(supabase_admin, email_l)
+    if matched is not None:
+        banned_until = getattr(matched, "banned_until", None)
+        if banned_until:
+            try:
+                bu = datetime.fromisoformat(str(banned_until).replace("Z", "+00:00"))
+                if bu > datetime.now(timezone.utc):
+                    return False, None
+            except Exception:
+                pass
+        return True, str(matched.id)
+
+    try:
+        ps = (
+            supabase_admin.table("pending_signups")
+            .select("id, status")
+            .eq("email", email_l)
+            .limit(1)
+            .execute()
+        )
+        if ps.data:
+            status_val = (ps.data[0].get("status") or "pending").lower()
+            if status_val in ("pending", "approved", "invited"):
+                return True, None
+    except Exception:
+        logger.exception("Error consultando pending_signups")
+
+    try:
+        inv = (
+            supabase_admin.table("access_invitations")
+            .select("id, expires_at, used")
+            .eq("email", email_l)
+            .eq("used", False)
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+        now = datetime.now(timezone.utc)
+        for row in inv.data or []:
+            exp = row.get("expires_at")
+            if exp:
+                try:
+                    exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                    if exp_dt < now:
+                        continue
+                except Exception:
+                    pass
+            return True, None
+    except Exception:
+        logger.exception("Error consultando access_invitations")
+
+    return False, None
+
+
+def _ensure_auth_user(supabase_admin, email: str) -> tuple[str, str]:
+    """Asegura que exista un usuario en auth.users. Devuelve (user_id, temp_password)."""
+    import secrets
+    import string
+
+    email_l = email.lower().strip()
+    temp_password = "Tmp!" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(24))
+
+    existing = _find_auth_user_by_email(supabase_admin, email_l)
+    existing_id = str(existing.id) if existing is not None else None
+
+    if existing_id:
+        supabase_admin.auth.admin.update_user_by_id(
+            existing_id,
+            {"password": temp_password, "email_confirm": True},
+        )
+        return existing_id, temp_password
+
+    result = supabase_admin.auth.admin.create_user(
+        {
+            "email": email_l,
+            "password": temp_password,
+            "email_confirm": True,
+            "user_metadata": {"source": "portal_invite"},
+        }
+    )
+    user_id = result.user.id
+
+    # Revisa si este correo tiene invitaciones pendientes (creadas desde el
+    # panel de admin). Si las hay, el rol del perfil y el acceso a proyectos
+    # vienen de ahí. Si no hay ninguna (ej. el ADMIN_EMAIL entrando por
+    # primera vez), se asume 'admin' para no romper el flujo actual.
+    role = "admin"
+    project_ids: list[str] = []
+    invitations: list[dict] = []
+    try:
+        inv = (
+            supabase_admin.table("access_invitations")
+            .select("id, project_id, type")
+            .eq("email", email_l)
+            .eq("used", False)
+            .execute()
+        )
+        invitations = inv.data or []
+        if invitations:
+            role = invitations[0].get("type") or "analyst"
+            project_ids = [row["project_id"] for row in invitations if row.get("project_id")]
+    except Exception:
+        logger.exception("No se pudieron leer invitaciones para %s", email_l)
+        invitations = []
+
+    try:
+        existing_profile = (
+            supabase_admin.table("profiles").select("id").eq("id", user_id).limit(1).execute()
+        )
+        if not existing_profile.data:
+            supabase_admin.table("profiles").insert(
+                {
+                    "id": user_id,
+                    "full_name": email_l.split("@")[0],
+                    "role": role,
+                }
+            ).execute()
+    except Exception:
+        logger.exception("No se pudo crear profile para %s", email_l)
+
+    for project_id in project_ids:
+        try:
+            supabase_admin.table("project_access").insert(
+                {"project_id": project_id, "user_id": user_id, "role": role}
+            ).execute()
+        except Exception:
+            logger.exception("No se pudo dar acceso al proyecto %s para %s", project_id, email_l)
+
+    if invitations:
+        try:
+            supabase_admin.table("access_invitations").update({"used": True}).eq(
+                "email", email_l
+            ).eq("used", False).execute()
+        except Exception:
+            pass
+
+    try:
+        supabase_admin.table("pending_signups").update({"status": "approved"}).eq(
+            "email", email_l
+        ).execute()
+    except Exception:
+        pass
+
+    return user_id, temp_password
+
+
+@router.post("/portal/login")
+def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
+    settings = get_settings()
+    supabase_admin = get_supabase_admin()
+    supabase_anon = get_supabase_anon()
+
+    if not settings.admin_email:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_EMAIL no está configurado en el servidor",
+        )
+
+    email_l = payload.email.lower().strip()
+    allowed, _ = _is_email_whitelisted(supabase_admin, email_l)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Este correo no tiene acceso. Solicita una invitación al administrador.",
+        )
+
+    try:
+        user_id, temp_password = _ensure_auth_user(supabase_admin, email_l)
+    except Exception as exc:
+        logger.exception("Error asegurando usuario portal")
+        raise HTTPException(status_code=400, detail=f"No se pudo preparar la cuenta: {exc}")
+
+    try:
+        auth_response = supabase_anon.auth.sign_in_with_password(
+            {"email": email_l, "password": temp_password}
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="No se pudo iniciar sesión. Contacta al administrador.")
+
+    if not auth_response or not auth_response.session:
+        raise HTTPException(status_code=401, detail="No se pudo iniciar sesión. Contacta al administrador.")
+
+    access_token = auth_response.session.access_token
+    refresh_token = auth_response.session.refresh_token
+
+    if not settings.otp_enabled:
+        # Modo local/desarrollo: se salta el OTP para no gastar envíos de correo.
+        return {
+            "message": "Sesión iniciada (OTP desactivado)",
+            "email": email_l,
+            "requiresOtp": False,
+            "otpDestination": "admin",
+            "session": {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+        }
+
+    supabase_admin.table("login_otps").update(
+        {"consumed_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("user_id", user_id).is_("consumed_at", "null").execute()
+
+    code = generate_otp_code()
+    code_hash = hash_otp(code)
+
+    supabase_admin.table("login_otps").insert(
+        {
+            "user_id": user_id,
+            "email": email_l,
+            "code_hash": code_hash,
+            "max_attempts": settings.otp_max_attempts,
+            "pending_access_token": access_token,
+            "pending_refresh_token": refresh_token,
+            "expires_at": get_otp_expiry().isoformat(),
+        }
+    ).execute()
+
+    background_tasks.add_task(_send_otp_email_safe, settings.admin_email, code)
+
+    return {
+        "message": "Código de verificación enviado al administrador",
+        "email": email_l,
+        "requiresOtp": True,
+        "otpDestination": "admin",
+    }
+
+
+@router.post("/portal/verify-otp")
+def portal_verify_otp(payload: VerifyOtpInput):
+    return verify_otp(payload)
+
+
+@router.post("/portal/resend-otp")
+def portal_resend_otp(payload: ResendOtpInput, background_tasks: BackgroundTasks):
+    settings = get_settings()
+    supabase_admin = get_supabase_admin()
+
+    if not settings.admin_email:
+        raise HTTPException(status_code=500, detail="ADMIN_EMAIL no configurado")
+
+    result = (
+        supabase_admin.table("login_otps")
+        .select("*")
+        .eq("email", payload.email.lower().strip())
+        .is_("consumed_at", "null")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        raise HTTPException(status_code=400, detail="No hay un inicio de sesión pendiente para este correo")
+
+    otp_row = rows[0]
+    code = generate_otp_code()
+    code_hash = hash_otp(code)
+
+    supabase_admin.table("login_otps").update(
+        {
+            "code_hash": code_hash,
+            "attempts": 0,
+            "expires_at": get_otp_expiry().isoformat(),
+        }
+    ).eq("id", otp_row["id"]).execute()
+
+    background_tasks.add_task(_send_otp_email_safe, settings.admin_email, code)
+    return {"message": "Código reenviado al administrador"}

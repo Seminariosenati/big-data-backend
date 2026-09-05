@@ -40,3 +40,25 @@ def send_otp_email(to_email: str, code: str) -> None:
         raise RuntimeError(
             f"EmailJS respondió {response.status_code}: {response.text}"
         )
+
+
+def send_invitation_email(to_email: str, project_name: str, login_url: str) -> None:
+    """Envía el correo de invitación a un proyecto usando la misma API de EmailJS."""
+    settings = get_settings()
+
+    payload = {
+        "service_id": settings.emailjs_service_id,
+        "template_id": settings.emailjs_invitation_template_id,
+        "user_id": settings.emailjs_public_key,
+        "accessToken": settings.emailjs_private_key,
+        "template_params": {
+            "to_email": to_email,
+            "project_name": project_name,
+            "login_url": login_url,
+        },
+    }
+
+    response = requests.post(EMAILJS_ENDPOINT, json=payload, timeout=10)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"EmailJS respondió {response.status_code}: {response.text}")
