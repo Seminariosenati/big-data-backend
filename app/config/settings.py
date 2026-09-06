@@ -35,6 +35,10 @@ class Settings:
     admin_email: str = os.environ.get("ADMIN_EMAIL") or os.environ.get("SMTP_USER", "")
     datasets_bucket: str = os.environ.get("DATASETS_BUCKET", "datasets")
 
+    # Nombre que aparece en la app autenticadora (Google Authenticator, Authy, etc.)
+    totp_issuer: str = os.environ.get("TOTP_ISSUER", "Datalume")
+    totp_recovery_codes_count: int = int(os.environ.get("TOTP_RECOVERY_CODES_COUNT", 10))
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -138,6 +138,7 @@ class ProjectRoleInput(BaseModel):
 
 class UserUpdateInput(BaseModel):
     role: str | None = Field(default=None, pattern="^analyst$")
+    full_name: str | None = Field(default=None, max_length=200)
     project_access: list[ProjectRoleInput] | None = None  # si viene, reemplaza el acceso completo
 
 
@@ -147,6 +148,17 @@ def update_user(user_id: str, payload: UserUpdateInput, auth=Depends(require_rol
 
     if payload.role is not None:
         result = supabase.table("profiles").update({"role": payload.role}).eq("id", user_id).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    if payload.full_name is not None:
+        cleaned = payload.full_name.strip()
+        result = (
+            supabase.table("profiles")
+            .update({"full_name": cleaned or None})
+            .eq("id", user_id)
+            .execute()
+        )
         if not result.data:
             raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
@@ -176,3 +188,209 @@ def delete_user(user_id: str, auth=Depends(require_role("admin"))):
     except Exception:
         logger.exception("No se pudo eliminar el usuario %s", user_id)
         raise HTTPException(status_code=400, detail="No se pudo eliminar el usuario")
+
+
+# ---------------------------------------------------------
+# Vistas por proyecto — reemplaza la pantalla que antes vivía dentro
+# de cada proyecto (ej. Datalume → Ajustes → Usuarios) para decidir
+# qué secciones del panel puede ver cada analista. Ahora se administra
+# desde aquí: el admin elige el proyecto y ve/edita los permisos de
+# cada uno de sus analistas (uno por analista, no uno solo para todos).
+# ---------------------------------------------------------
+DEFAULT_PERMISSIONS = {
+    "ventas": True,
+    "ventas_resumen": True,
+    "ventas_clientes": True,
+    "ventas_comparacion": True,
+    "cargar": False,
+    "explorar": False,
+    "reportes": True,
+}
+
+
+class ProjectAnalystPermissionsInput(BaseModel):
+    ventas: bool
+    ventas_resumen: bool
+    ventas_clientes: bool
+    ventas_comparacion: bool
+    cargar: bool
+    explorar: bool
+    reportes: bool
+
+
+@router.get("/projects/{project_id}/analysts")
+def list_project_analysts(project_id: str, auth=Depends(require_role("admin"))):
+    supabase = get_supabase_admin()
+
+    access_rows = (
+        supabase.table("project_access")
+        .select("user_id")
+        .eq("project_id", project_id)
+        .eq("role", "analyst")
+        .execute()
+    ).data or []
+    analyst_ids = [row["user_id"] for row in access_rows]
+    if not analyst_ids:
+        return []
+
+    profiles = (
+        supabase.table("profiles")
+        .select("id, full_name, phone, created_at")
+        .in_("id", analyst_ids)
+        .execute()
+    ).data or []
+
+    perms = (
+        supabase.table("analyst_permissions")
+        .select("*")
+        .in_("user_id", analyst_ids)
+        .execute()
+    ).data or []
+    perms_by_id = {row["user_id"]: row for row in perms}
+
+    try:
+        page = supabase.auth.admin.list_users()
+        auth_users = page.users if hasattr(page, "users") else (page or [])
+        emails = {str(u.id): u.email for u in auth_users}
+    except Exception:
+        logger.exception("No se pudo listar usuarios de auth")
+        emails = {}
+
+    return [
+        {
+            "id": p["id"],
+            "full_name": p.get("full_name"),
+            "email": emails.get(p["id"]),
+            "phone": p.get("phone"),
+            "created_at": p.get("created_at"),
+            "permissions": perms_by_id.get(p["id"], {**DEFAULT_PERMISSIONS, "user_id": p["id"]}),
+        }
+        for p in profiles
+    ]
+
+
+@router.put("/projects/{project_id}/analysts/{analyst_id}/permissions")
+def update_project_analyst_permissions(
+    project_id: str,
+    analyst_id: str,
+    payload: ProjectAnalystPermissionsInput,
+    auth=Depends(require_role("admin")),
+):
+    supabase = get_supabase_admin()
+
+    owned = (
+        supabase.table("project_access")
+        .select("user_id")
+        .eq("project_id", project_id)
+        .eq("user_id", analyst_id)
+        .eq("role", "analyst")
+        .limit(1)
+        .execute()
+    )
+    if not owned.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Ese analista no tiene acceso de analista a este proyecto",
+        )
+
+    data = {"user_id": analyst_id, "created_by": auth["user"].id, **payload.model_dump()}
+    result = supabase.table("analyst_permissions").upsert(data, on_conflict="user_id").execute()
+    return result.data[0] if result.data else data
+
+
+# ---------------------------------------------------------
+# Datasets por analista — qué archivos concretos (CSV ya cargados)
+# puede ver cada analista, controlado también desde el Portal en vez
+# de desde dentro de cada proyecto. Se apoya en el "entorno de datos"
+# (projects.env_owner_id) que vincula un proyecto del Portal con el
+# usuario dueño real de esos datasets.
+# ---------------------------------------------------------
+def _require_project_analyst_and_env(supabase, project_id: str, analyst_id: str) -> str:
+    project = (
+        supabase.table("projects").select("id, env_owner_id").eq("id", project_id).limit(1).execute()
+    )
+    if not project.data or not project.data[0].get("env_owner_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="Este proyecto todavía no tiene un entorno de datos vinculado",
+        )
+
+    owned = (
+        supabase.table("project_access")
+        .select("user_id")
+        .eq("project_id", project_id)
+        .eq("user_id", analyst_id)
+        .eq("role", "analyst")
+        .limit(1)
+        .execute()
+    )
+    if not owned.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Ese analista no tiene acceso de analista a este proyecto",
+        )
+
+    return project.data[0]["env_owner_id"]
+
+
+@router.get("/projects/{project_id}/analysts/{analyst_id}/datasets")
+def list_project_analyst_datasets(project_id: str, analyst_id: str, auth=Depends(require_role("admin"))):
+    supabase = get_supabase_admin()
+    env_owner_id = _require_project_analyst_and_env(supabase, project_id, analyst_id)
+
+    datasets = (
+        supabase.table("datasets")
+        .select("id, file_name, created_at")
+        .eq("user_id", env_owner_id)
+        .order("created_at", desc=True)
+        .execute()
+    ).data or []
+
+    access = (
+        supabase.table("analyst_dataset_access")
+        .select("dataset_id")
+        .eq("analyst_id", analyst_id)
+        .execute()
+    ).data or []
+    allowed_ids = {row["dataset_id"] for row in access}
+
+    return [
+        {"id": d["id"], "file_name": d["file_name"], "allowed": d["id"] in allowed_ids}
+        for d in datasets
+    ]
+
+
+class ProjectAnalystDatasetsInput(BaseModel):
+    dataset_ids: list[str] = Field(default_factory=list)
+
+
+@router.put("/projects/{project_id}/analysts/{analyst_id}/datasets")
+def update_project_analyst_datasets(
+    project_id: str,
+    analyst_id: str,
+    payload: ProjectAnalystDatasetsInput,
+    auth=Depends(require_role("admin")),
+):
+    supabase = get_supabase_admin()
+    env_owner_id = _require_project_analyst_and_env(supabase, project_id, analyst_id)
+
+    # Nunca confiar en los ids tal cual: solo se permiten datasets que de
+    # verdad pertenecen al entorno de datos de este proyecto.
+    valid_ids: list[str] = []
+    if payload.dataset_ids:
+        valid = (
+            supabase.table("datasets")
+            .select("id")
+            .eq("user_id", env_owner_id)
+            .in_("id", payload.dataset_ids)
+            .execute()
+        )
+        valid_ids = [d["id"] for d in (valid.data or [])]
+
+    supabase.table("analyst_dataset_access").delete().eq("analyst_id", analyst_id).execute()
+    if valid_ids:
+        supabase.table("analyst_dataset_access").insert(
+            [{"analyst_id": analyst_id, "dataset_id": did} for did in valid_ids]
+        ).execute()
+
+    return {"dataset_ids": valid_ids}

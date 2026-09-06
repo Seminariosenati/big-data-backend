@@ -1,12 +1,22 @@
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
 
 from app.config.settings import get_settings, get_supabase_admin, get_supabase_anon
 from app.utils.otp import generate_otp_code, hash_otp, compare_otp, get_otp_expiry
 from app.utils.mailer import send_otp_email
+from app.utils.auth_dependency import require_auth
+from app.utils.totp import (
+    generate_totp_secret,
+    get_provisioning_uri,
+    generate_qr_code_data_uri,
+    verify_totp_code,
+    generate_recovery_codes,
+    hash_recovery_code,
+    compare_recovery_code,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -22,23 +32,34 @@ def _send_otp_email_safe(to_email: str, code: str) -> None:
         logger.exception("No se pudo enviar el correo de verificación a %s", to_email)
 
 
+def _verify_totp_login_step(supabase_admin, user_id: str, code: str) -> bool:
+    """Valida el código del paso 2 del login cuando el usuario tiene TOTP
+    activo: primero contra el código de 6 dígitos de su app autenticadora,
+    y si no coincide, contra sus códigos de recuperación sin usar."""
+    profile = supabase_admin.table("profiles").select("totp_secret").eq("id", user_id).limit(1).execute()
+    secret = profile.data[0].get("totp_secret") if profile.data else None
+    if secret and verify_totp_code(secret, code):
+        return True
+
+    candidates = (
+        supabase_admin.table("totp_recovery_codes")
+        .select("id, code_hash")
+        .eq("user_id", user_id)
+        .is_("used_at", "null")
+        .execute()
+    )
+    for row in candidates.data or []:
+        if compare_recovery_code(code, row["code_hash"]):
+            supabase_admin.table("totp_recovery_codes").update(
+                {"used_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", row["id"]).execute()
+            return True
+    return False
+
+
 # ---------------------------------------------------------
 # Esquemas
 # ---------------------------------------------------------
-class RegisterInput(BaseModel):
-    model_config = {"populate_by_name": True}
-
-    full_name: str = Field(min_length=1, alias="fullName")
-    email: EmailStr
-    company: str | None = None
-    password: str = Field(min_length=8)
-
-
-class LoginInput(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=1)
-
-
 class VerifyOtpInput(BaseModel):
     email: EmailStr
     code: str = Field(min_length=4)
@@ -52,98 +73,26 @@ class RefreshInput(BaseModel):
     refresh_token: str = Field(min_length=1)
 
 
-# ---------------------------------------------------------
-# POST /auth/register
-# ---------------------------------------------------------
-@router.post("/register", status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterInput):
-    supabase = get_supabase_admin()
+class TwoFaConfirmInput(BaseModel):
+    code: str = Field(min_length=4)
 
-    try:
-        result = supabase.auth.admin.create_user(
-            {
-                "email": payload.email,
-                "password": payload.password,
-                "email_confirm": True,
-                "user_metadata": {
-                    "full_name": payload.full_name,
-                    "company": payload.company,
-                },
-            }
-        )
-    except Exception as exc:
-        message = str(exc)
-        code = status.HTTP_409_CONFLICT if "already" in message.lower() else status.HTTP_400_BAD_REQUEST
-        raise HTTPException(status_code=code, detail=message)
 
-    return {
-        "message": "Cuenta creada correctamente. Ya puedes iniciar sesión.",
-        "userId": result.user.id,
-    }
+class TwoFaDisableInput(BaseModel):
+    code: str = Field(min_length=4)
 
 
 # ---------------------------------------------------------
-# POST /auth/login (paso 1: correo + contraseña)
+# NOTA: el login independiente de Datalume (/auth/datalume/login) fue
+# retirado. El Portal es ahora el único punto de entrada: su sesión
+# (misma cookie/JWT de Supabase) sirve directamente para llamar a la
+# API de Datalume, y el rol guardado en profiles decide qué panel ve
+# cada quien. Los helpers _is_email_whitelisted/_ensure_auth_user de
+# abajo siguen en uso por /auth/portal/login.
 # ---------------------------------------------------------
-@router.post("/login")
-def login(payload: LoginInput, background_tasks: BackgroundTasks):
-    settings = get_settings()
-    supabase_anon = get_supabase_anon()
-    supabase_admin = get_supabase_admin()
-
-    try:
-        auth_response = supabase_anon.auth.sign_in_with_password(
-            {"email": payload.email, "password": payload.password}
-        )
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Correo o contraseña incorrectos")
-
-    if not auth_response or not auth_response.session:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Correo o contraseña incorrectos")
-
-    user_id = auth_response.user.id
-    access_token = auth_response.session.access_token
-    refresh_token = auth_response.session.refresh_token
-
-    if not settings.otp_enabled:
-        return {
-            "message": "Sesión iniciada (OTP desactivado)",
-            "email": payload.email,
-            "requiresOtp": False,
-            "session": {"access_token": access_token, "refresh_token": refresh_token},
-        }
-
-    # Invalida OTPs anteriores no consumidos
-    supabase_admin.table("login_otps").update(
-        {"consumed_at": datetime.now(timezone.utc).isoformat()}
-    ).eq("user_id", user_id).is_("consumed_at", "null").execute()
-
-    code = generate_otp_code()
-    code_hash = hash_otp(code)
-
-    supabase_admin.table("login_otps").insert(
-        {
-            "user_id": user_id,
-            "email": payload.email,
-            "code_hash": code_hash,
-            "max_attempts": settings.otp_max_attempts,
-            "pending_access_token": access_token,
-            "pending_refresh_token": refresh_token,
-            "expires_at": get_otp_expiry().isoformat(),
-        }
-    ).execute()
-
-    background_tasks.add_task(_send_otp_email_safe, payload.email, code)
-
-    return {
-        "message": "Código de verificación enviado a tu correo",
-        "email": payload.email,
-        "requiresOtp": True,
-    }
 
 
 # ---------------------------------------------------------
-# POST /auth/verify-otp (paso 2)
+# POST /auth/verify-otp (paso 2, compartido por Portal)
 # ---------------------------------------------------------
 @router.post("/verify-otp")
 def verify_otp(payload: VerifyOtpInput):
@@ -174,11 +123,18 @@ def verify_otp(payload: VerifyOtpInput):
     if otp_row["attempts"] >= otp_row["max_attempts"]:
         raise HTTPException(status_code=429, detail="Se agotaron los intentos. Inicia sesión de nuevo.")
 
-    if not compare_otp(payload.code, otp_row["code_hash"]):
+    method = otp_row.get("method") or "email"
+    if method == "totp":
+        code_valid = _verify_totp_login_step(supabase_admin, otp_row["user_id"], payload.code)
+    else:
+        code_valid = bool(otp_row["code_hash"]) and compare_otp(payload.code, otp_row["code_hash"])
+
+    if not code_valid:
         supabase_admin.table("login_otps").update({"attempts": otp_row["attempts"] + 1}).eq(
             "id", otp_row["id"]
         ).execute()
-        raise HTTPException(status_code=401, detail="Código incorrecto")
+        detail = "Código incorrecto" if method == "email" else "Código incorrecto o vencido"
+        raise HTTPException(status_code=401, detail=detail)
 
     supabase_admin.table("login_otps").update(
         {"consumed_at": datetime.now(timezone.utc).isoformat()}
@@ -255,10 +211,14 @@ def refresh_session(payload: RefreshInput):
 
 
 # ---------------------------------------------------------
-# PORTAL: login solo con correo (sin contraseña)
-# El OTP se envía al ADMIN_EMAIL. Solo correos en whitelist
-# (pending_signups aprobados, profiles existentes, o
-# invitaciones válidas) pueden solicitar acceso.
+# PORTAL: login solo con correo (sin contraseña). Solo correos en
+# whitelist (pending_signups aprobados, profiles existentes, o
+# invitaciones válidas) pueden solicitar acceso. El segundo paso
+# depende de la cuenta:
+#   - Si activó una app autenticadora (2fa/setup): se le pide el
+#     código de 6 dígitos de su app (o un código de recuperación).
+#   - Si no, el código de un solo uso se envía al ADMIN_EMAIL, quien
+#     se lo comparte para completar el ingreso.
 # ---------------------------------------------------------
 
 class PortalLoginInput(BaseModel):
@@ -360,29 +320,38 @@ def _ensure_auth_user(supabase_admin, email: str) -> tuple[str, str]:
 
     existing = _find_auth_user_by_email(supabase_admin, email_l)
     existing_id = str(existing.id) if existing is not None else None
+    is_new_user = existing_id is None
 
     if existing_id:
         supabase_admin.auth.admin.update_user_by_id(
             existing_id,
             {"password": temp_password, "email_confirm": True},
         )
-        return existing_id, temp_password
-
-    result = supabase_admin.auth.admin.create_user(
-        {
-            "email": email_l,
-            "password": temp_password,
-            "email_confirm": True,
-            "user_metadata": {"source": "portal_invite"},
-        }
-    )
-    user_id = result.user.id
+        user_id = existing_id
+    else:
+        result = supabase_admin.auth.admin.create_user(
+            {
+                "email": email_l,
+                "password": temp_password,
+                "email_confirm": True,
+                "user_metadata": {"source": "portal_invite"},
+            }
+        )
+        user_id = result.user.id
 
     # Revisa si este correo tiene invitaciones pendientes (creadas desde el
     # panel de admin). Si las hay, el rol del perfil y el acceso a proyectos
-    # vienen de ahí. Si no hay ninguna (ej. el ADMIN_EMAIL entrando por
-    # primera vez), se asume 'admin' para no romper el flujo actual.
-    role = "admin"
+    # vienen de ahí. Solo el ADMIN_EMAIL configurado puede ser 'admin' del
+    # portal; cualquier otra cuenta nueva sin invitación (ej. entró por
+    # pending_signups) cae en 'analyst' por default — nunca en 'admin'.
+    # Si la cuenta ya existía y no tiene invitaciones pendientes, no se toca
+    # su perfil/acceso: ya se creó antes.
+    settings = get_settings()
+    is_admin_email = bool(settings.admin_email) and email_l == settings.admin_email.lower().strip()
+    if is_new_user:
+        role = "admin" if is_admin_email else "analyst"
+    else:
+        role = None
     project_ids: list[str] = []
     invitations: list[dict] = []
     try:
@@ -401,20 +370,48 @@ def _ensure_auth_user(supabase_admin, email: str) -> tuple[str, str]:
         logger.exception("No se pudieron leer invitaciones para %s", email_l)
         invitations = []
 
+    if role is None:
+        # Cuenta existente sin invitaciones pendientes: nada nuevo que crear.
+        return user_id, temp_password
+
+    # El "entorno de datos" (profiles.owner_id) es lo que de verdad controla
+    # qué datasets puede ver el analista dentro del proyecto (ej. Datalume).
+    # Se toma del primer proyecto de la invitación; si ese proyecto todavía
+    # no tiene un entorno vinculado (projects.env_owner_id), el analista
+    # queda sin datasets hasta que se configure, pero sí puede entrar.
+    owner_id = None
+    if project_ids:
+        try:
+            proj = (
+                supabase_admin.table("projects")
+                .select("env_owner_id")
+                .eq("id", project_ids[0])
+                .limit(1)
+                .execute()
+            )
+            if proj.data:
+                owner_id = proj.data[0].get("env_owner_id")
+        except Exception:
+            logger.exception("No se pudo leer el entorno de datos del proyecto %s", project_ids[0])
+
+    # A partir de aquí puede haber trabajo pendiente (perfil y/o acceso a
+    # proyectos). Si algo de esto falla, la invitación NO se marca como
+    # usada: así queda "Pendiente" en el panel y se puede reintentar, en vez
+    # de quedar "Usada" para siempre sin una cuenta funcional detrás.
+    setup_failed = False
+
     try:
-        existing_profile = (
-            supabase_admin.table("profiles").select("id").eq("id", user_id).limit(1).execute()
-        )
-        if not existing_profile.data:
-            supabase_admin.table("profiles").insert(
-                {
-                    "id": user_id,
-                    "full_name": email_l.split("@")[0],
-                    "role": role,
-                }
-            ).execute()
+        # El trigger on_auth_user_created de la base ya garantiza que esta
+        # fila existe (con role='analyst' por default); acá la dejamos con
+        # el rol y el entorno de datos que le corresponden según su
+        # invitación, en vez de solo insertar si faltara.
+        profile_update = {"full_name": email_l.split("@")[0], "role": role}
+        if owner_id:
+            profile_update["owner_id"] = owner_id
+        supabase_admin.table("profiles").update(profile_update).eq("id", user_id).execute()
     except Exception:
-        logger.exception("No se pudo crear profile para %s", email_l)
+        logger.exception("No se pudo actualizar profile para %s", email_l)
+        setup_failed = True
 
     for project_id in project_ids:
         try:
@@ -423,14 +420,22 @@ def _ensure_auth_user(supabase_admin, email: str) -> tuple[str, str]:
             ).execute()
         except Exception:
             logger.exception("No se pudo dar acceso al proyecto %s para %s", project_id, email_l)
+            setup_failed = True
 
-    if invitations:
+    if invitations and not setup_failed:
         try:
             supabase_admin.table("access_invitations").update({"used": True}).eq(
                 "email", email_l
             ).eq("used", False).execute()
         except Exception:
-            pass
+            logger.exception("No se pudo marcar como usada la invitación de %s", email_l)
+            setup_failed = True
+
+    if setup_failed:
+        raise RuntimeError(
+            f"La cuenta de {email_l} se preparó parcialmente pero falló crear su perfil o "
+            "su acceso a proyecto. Revisa los logs del backend antes de reintentar."
+        )
 
     try:
         supabase_admin.table("pending_signups").update({"status": "approved"}).eq(
@@ -481,6 +486,41 @@ def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
     access_token = auth_response.session.access_token
     refresh_token = auth_response.session.refresh_token
 
+    # Si la cuenta activó una app autenticadora (Google Authenticator, Authy,
+    # etc. — configurable desde /auth/2fa/setup), ese es su segundo factor y
+    # reemplaza al OTP por correo del admin: no se le avisa a nadie más, se
+    # le pide directamente el código que ya genera su app.
+    profile_result = (
+        supabase_admin.table("profiles").select("totp_enabled").eq("id", user_id).limit(1).execute()
+    )
+    totp_enabled = bool(profile_result.data and profile_result.data[0].get("totp_enabled"))
+
+    supabase_admin.table("login_otps").update(
+        {"consumed_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("user_id", user_id).is_("consumed_at", "null").execute()
+
+    if totp_enabled:
+        supabase_admin.table("login_otps").insert(
+            {
+                "user_id": user_id,
+                "email": email_l,
+                "code_hash": None,
+                "method": "totp",
+                "max_attempts": settings.otp_max_attempts,
+                "pending_access_token": access_token,
+                "pending_refresh_token": refresh_token,
+                "expires_at": get_otp_expiry().isoformat(),
+            }
+        ).execute()
+
+        return {
+            "message": "Ingresa el código de tu app autenticadora",
+            "email": email_l,
+            "requiresOtp": True,
+            "method": "totp",
+            "otpDestination": "self",
+        }
+
     if not settings.otp_enabled:
         # Modo local/desarrollo: se salta el OTP para no gastar envíos de correo.
         return {
@@ -493,10 +533,6 @@ def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
                 "refresh_token": refresh_token,
             },
         }
-
-    supabase_admin.table("login_otps").update(
-        {"consumed_at": datetime.now(timezone.utc).isoformat()}
-    ).eq("user_id", user_id).is_("consumed_at", "null").execute()
 
     code = generate_otp_code()
     code_hash = hash_otp(code)
@@ -550,6 +586,12 @@ def portal_resend_otp(payload: ResendOtpInput, background_tasks: BackgroundTasks
         raise HTTPException(status_code=400, detail="No hay un inicio de sesión pendiente para este correo")
 
     otp_row = rows[0]
+    if (otp_row.get("method") or "email") == "totp":
+        raise HTTPException(
+            status_code=400,
+            detail="Esta cuenta usa una app autenticadora; no hay código para reenviar.",
+        )
+
     code = generate_otp_code()
     code_hash = hash_otp(code)
 
@@ -563,3 +605,143 @@ def portal_resend_otp(payload: ResendOtpInput, background_tasks: BackgroundTasks
 
     background_tasks.add_task(_send_otp_email_safe, settings.admin_email, code)
     return {"message": "Código reenviado al administrador"}
+
+
+# ---------------------------------------------------------
+# 2FA con app autenticadora (Google Authenticator, Authy, etc.)
+# Vive bajo /auth/2fa/* y siempre requiere sesión activa: es el
+# propio usuario configurando su cuenta, no parte del login.
+# ---------------------------------------------------------
+
+
+@router.get("/2fa/status")
+def get_2fa_status(auth: dict = Depends(require_auth)):
+    supabase_admin = get_supabase_admin()
+    profile = (
+        supabase_admin.table("profiles")
+        .select("totp_enabled, totp_confirmed_at")
+        .eq("id", auth["user"].id)
+        .limit(1)
+        .execute()
+    )
+    data = profile.data[0] if profile.data else {}
+    return {
+        "enabled": bool(data.get("totp_enabled")),
+        "confirmedAt": data.get("totp_confirmed_at"),
+    }
+
+
+@router.post("/2fa/setup")
+def setup_2fa(auth: dict = Depends(require_auth)):
+    """Genera un secreto nuevo (pendiente de confirmar) y el QR para escanear."""
+    supabase_admin = get_supabase_admin()
+    user = auth["user"]
+
+    existing = supabase_admin.table("profiles").select("totp_enabled").eq("id", user.id).limit(1).execute()
+    if existing.data and existing.data[0].get("totp_enabled"):
+        raise HTTPException(
+            status_code=400,
+            detail="La autenticación de 2 factores ya está activa. Desactívala antes de generar un nuevo código.",
+        )
+
+    secret = generate_totp_secret()
+    supabase_admin.table("profiles").update(
+        {"totp_secret": secret, "totp_enabled": False, "totp_confirmed_at": None}
+    ).eq("id", user.id).execute()
+
+    otpauth_url = get_provisioning_uri(secret, user.email)
+
+    return {
+        "secret": secret,
+        "otpauthUrl": otpauth_url,
+        "qrCode": generate_qr_code_data_uri(otpauth_url),
+    }
+
+
+@router.post("/2fa/confirm")
+def confirm_2fa(payload: TwoFaConfirmInput, auth: dict = Depends(require_auth)):
+    """Confirma el código mostrado por la app autenticadora y activa el 2FA."""
+    supabase_admin = get_supabase_admin()
+    user = auth["user"]
+
+    profile = supabase_admin.table("profiles").select("totp_secret").eq("id", user.id).limit(1).execute()
+    secret = profile.data[0].get("totp_secret") if profile.data else None
+    if not secret:
+        raise HTTPException(status_code=400, detail="Primero genera un código QR desde /auth/2fa/setup.")
+
+    if not verify_totp_code(secret, payload.code):
+        raise HTTPException(
+            status_code=401,
+            detail="El código no es válido. Revisa la hora de tu teléfono e inténtalo de nuevo.",
+        )
+
+    supabase_admin.table("profiles").update(
+        {"totp_enabled": True, "totp_confirmed_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", user.id).execute()
+
+    # Códigos de recuperación nuevos cada vez que se (re)activa el 2FA
+    supabase_admin.table("totp_recovery_codes").delete().eq("user_id", user.id).execute()
+    codes = generate_recovery_codes()
+    supabase_admin.table("totp_recovery_codes").insert(
+        [{"user_id": user.id, "code_hash": hash_recovery_code(c)} for c in codes]
+    ).execute()
+
+    return {
+        "message": "Autenticación de 2 factores activada",
+        "recoveryCodes": codes,
+    }
+
+
+@router.post("/2fa/disable")
+def disable_2fa(payload: TwoFaDisableInput, auth: dict = Depends(require_auth)):
+    """Desactiva el 2FA. Como ya no hay contraseñas, se pide de nuevo el
+    código de la app (o uno de recuperación) para evitar que una sesión
+    abierta en un dispositivo ajeno lo desactive sin más."""
+    supabase_admin = get_supabase_admin()
+    user = auth["user"]
+
+    profile = supabase_admin.table("profiles").select("totp_secret").eq("id", user.id).limit(1).execute()
+    secret = profile.data[0].get("totp_secret") if profile.data else None
+
+    code_valid = bool(secret) and verify_totp_code(secret, payload.code)
+    if not code_valid:
+        candidates = (
+            supabase_admin.table("totp_recovery_codes")
+            .select("id, code_hash")
+            .eq("user_id", user.id)
+            .is_("used_at", "null")
+            .execute()
+        )
+        for row in candidates.data or []:
+            if compare_recovery_code(payload.code, row["code_hash"]):
+                code_valid = True
+                break
+
+    if not code_valid:
+        raise HTTPException(status_code=401, detail="Código incorrecto")
+
+    supabase_admin.table("profiles").update(
+        {"totp_enabled": False, "totp_secret": None, "totp_confirmed_at": None}
+    ).eq("id", user.id).execute()
+    supabase_admin.table("totp_recovery_codes").delete().eq("user_id", user.id).execute()
+
+    return {"message": "Autenticación de 2 factores desactivada"}
+
+
+@router.post("/2fa/recovery-codes/regenerate")
+def regenerate_recovery_codes(auth: dict = Depends(require_auth)):
+    """Invalida los códigos de recuperación anteriores y genera un set nuevo."""
+    supabase_admin = get_supabase_admin()
+    user = auth["user"]
+
+    profile = supabase_admin.table("profiles").select("totp_enabled").eq("id", user.id).limit(1).execute()
+    if not profile.data or not profile.data[0].get("totp_enabled"):
+        raise HTTPException(status_code=400, detail="Activa primero la autenticación de 2 factores.")
+
+    supabase_admin.table("totp_recovery_codes").delete().eq("user_id", user.id).execute()
+    codes = generate_recovery_codes()
+    supabase_admin.table("totp_recovery_codes").insert(
+        [{"user_id": user.id, "code_hash": hash_recovery_code(c)} for c in codes]
+    ).execute()
+
+    return {"recoveryCodes": codes}
