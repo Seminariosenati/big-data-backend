@@ -11,7 +11,9 @@ class ProfileUpdate(BaseModel):
     full_name: str | None = None
     company: str | None = None
     phone: str | None = None
-    role: str | None = None
+    # NOTA: "role" fue removido a propósito. El rol de un usuario solo lo
+    # puede cambiar el admin principal (desde el Portal, /admin/users/{id}),
+    # nunca el propio usuario editando su perfil.
 
 
 @router.get("/me")

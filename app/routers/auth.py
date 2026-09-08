@@ -223,6 +223,12 @@ def refresh_session(payload: RefreshInput):
 
 class PortalLoginInput(BaseModel):
     email: EmailStr
+    # Método elegido por el usuario en el paso 1 del login, SOLO relevante
+    # cuando la cuenta tiene la app autenticadora activa (totp_enabled=True):
+    # le permite optar por recibir igual el código OTP por correo al admin
+    # en vez de usar su app. Si la cuenta no tiene TOTP activo, este campo
+    # se ignora (solo existe el método por correo). Valores: "totp" | "email".
+    method: str | None = None
 
 
 def _find_auth_user_by_email(supabase_admin, email: str):
@@ -487,19 +493,34 @@ def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
     refresh_token = auth_response.session.refresh_token
 
     # Si la cuenta activó una app autenticadora (Google Authenticator, Authy,
-    # etc. — configurable desde /auth/2fa/setup), ese es su segundo factor y
-    # reemplaza al OTP por correo del admin: no se le avisa a nadie más, se
-    # le pide directamente el código que ya genera su app.
+    # etc. — configurable desde /auth/2fa/setup), tiene dos métodos posibles
+    # para este segundo paso: su app autenticadora, o el OTP de siempre por
+    # correo al admin. Si el cliente todavía no indicó cuál prefiere,
+    # devolvemos las opciones para que el usuario elija en el login (sin
+    # generar todavía ningún código ni fila de login_otps).
     profile_result = (
         supabase_admin.table("profiles").select("totp_enabled").eq("id", user_id).limit(1).execute()
     )
     totp_enabled = bool(profile_result.data and profile_result.data[0].get("totp_enabled"))
 
+    chosen_method = (payload.method or "").strip().lower() or None
+    if chosen_method not in (None, "totp", "email"):
+        chosen_method = None
+
+    if totp_enabled and chosen_method is None:
+        return {
+            "message": "Elige cómo quieres verificar tu identidad",
+            "email": email_l,
+            "requiresOtp": True,
+            "requiresMethodSelection": True,
+            "availableMethods": ["totp", "email"],
+        }
+
     supabase_admin.table("login_otps").update(
         {"consumed_at": datetime.now(timezone.utc).isoformat()}
     ).eq("user_id", user_id).is_("consumed_at", "null").execute()
 
-    if totp_enabled:
+    if totp_enabled and chosen_method == "totp":
         supabase_admin.table("login_otps").insert(
             {
                 "user_id": user_id,
@@ -542,6 +563,7 @@ def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
             "user_id": user_id,
             "email": email_l,
             "code_hash": code_hash,
+            "method": "email",
             "max_attempts": settings.otp_max_attempts,
             "pending_access_token": access_token,
             "pending_refresh_token": refresh_token,
@@ -555,6 +577,7 @@ def portal_login(payload: PortalLoginInput, background_tasks: BackgroundTasks):
         "message": "Código de verificación enviado al administrador",
         "email": email_l,
         "requiresOtp": True,
+        "method": "email",
         "otpDestination": "admin",
     }
 
