@@ -27,6 +27,15 @@ class Settings:
     emailjs_public_key: str = os.environ.get("EMAILJS_PUBLIC_KEY", "")
     emailjs_private_key: str = os.environ.get("EMAILJS_PRIVATE_KEY", "")
     emailjs_invitation_template_id: str = os.environ.get("EMAILJS_INVITATION_TEMPLATE_ID", "")
+    # Cuenta EmailJS separada (otro Gmail) para los correos de contacto,
+    # porque el plan free de EmailJS solo permite 2 templates por cuenta.
+    emailjs_contact_service_id: str = os.environ.get("EMAILJS_CONTACT_SERVICE_ID", "") or os.environ.get("EMAILJS_SERVICE_ID", "")
+    emailjs_contact_public_key: str = os.environ.get("EMAILJS_CONTACT_PUBLIC_KEY", "") or os.environ.get("EMAILJS_PUBLIC_KEY", "")
+    emailjs_contact_private_key: str = os.environ.get("EMAILJS_CONTACT_PRIVATE_KEY", "") or os.environ.get("EMAILJS_PRIVATE_KEY", "")
+    # Alerta al admin cuando llega un mensaje nuevo del formulario de contacto.
+    emailjs_contact_alert_template_id: str = os.environ.get("EMAILJS_CONTACT_ALERT_TEMPLATE_ID", "")
+    # Respuesta del admin, enviada al correo que la persona puso en el formulario.
+    emailjs_contact_reply_template_id: str = os.environ.get("EMAILJS_CONTACT_REPLY_TEMPLATE_ID", "")
 
     otp_enabled: bool = os.environ.get("OTP_ENABLED", "true").lower() not in ("false", "0", "no")
     otp_length: int = int(os.environ.get("OTP_LENGTH", 6))

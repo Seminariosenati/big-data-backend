@@ -62,3 +62,60 @@ def send_invitation_email(to_email: str, project_name: str, login_url: str) -> N
 
     if response.status_code != 200:
         raise RuntimeError(f"EmailJS respondió {response.status_code}: {response.text}")
+
+
+def send_contact_alert_email(name: str, from_email: str, company: str | None, message: str) -> None:
+    """Avisa al administrador (ADMIN_EMAIL) que llegó un mensaje nuevo desde
+    el formulario público de contacto, usando la misma API de EmailJS.
+
+    Requiere un "Email Template" en EmailJS con variables:
+    {{to_email}}, {{sender_name}}, {{sender_email}}, {{sender_company}}, {{message}}
+    """
+    settings = get_settings()
+
+    payload = {
+        "service_id": settings.emailjs_contact_service_id,
+        "template_id": settings.emailjs_contact_alert_template_id,
+        "user_id": settings.emailjs_contact_public_key,
+        "accessToken": settings.emailjs_contact_private_key,
+        "template_params": {
+            "to_email": settings.admin_email,
+            "sender_name": name,
+            "sender_email": from_email,
+            "sender_company": company or "(no especificada)",
+            "message": message,
+        },
+    }
+
+    response = requests.post(EMAILJS_ENDPOINT, json=payload, timeout=10)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"EmailJS respondió {response.status_code}: {response.text}")
+
+
+def send_contact_reply_email(to_email: str, name: str, original_message: str, reply: str) -> None:
+    """Envía la respuesta del admin al correo que la persona dejó en el
+    formulario de contacto, usando la misma API de EmailJS.
+
+    Requiere un "Email Template" en EmailJS con variables:
+    {{to_email}}, {{sender_name}}, {{original_message}}, {{reply}}
+    """
+    settings = get_settings()
+
+    payload = {
+        "service_id": settings.emailjs_contact_service_id,
+        "template_id": settings.emailjs_contact_reply_template_id,
+        "user_id": settings.emailjs_contact_public_key,
+        "accessToken": settings.emailjs_contact_private_key,
+        "template_params": {
+            "to_email": to_email,
+            "sender_name": name,
+            "original_message": original_message,
+            "reply": reply,
+        },
+    }
+
+    response = requests.post(EMAILJS_ENDPOINT, json=payload, timeout=10)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"EmailJS respondió {response.status_code}: {response.text}")
