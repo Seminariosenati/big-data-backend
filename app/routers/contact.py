@@ -111,3 +111,25 @@ def reply_contact_message(message_id: str, payload: ContactReplyInput, auth=Depe
         )
 
     return result.data[0]
+
+
+# ---------------------------------------------------------
+# DELETE /contact/{id} — el admin borra un mensaje de contacto
+# (ya sea pendiente o respondido).
+# ---------------------------------------------------------
+@router.delete("/{message_id}", status_code=204)
+def delete_contact_message(message_id: str, auth=Depends(require_role("admin"))):
+    supabase = get_supabase_admin()
+
+    existing = (
+        supabase.table("contact_messages")
+        .select("id")
+        .eq("id", message_id)
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Mensaje no encontrado")
+
+    supabase.table("contact_messages").delete().eq("id", message_id).execute()
+    return None
